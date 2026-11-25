@@ -1,0 +1,15 @@
+# Исходные данные организатора (не публикуются)
+data/organizer/
+
+# Сгенерированный локальный индекс
+data/organizer_index.sqlite
+data/organizer_index.sqlite-wal
+data/organizer_index.sqlite-shm
+
+# Служебные файлы Python
+__pycache__/
+*.pyc
+
+# Секреты: ключ YandexGPT живёт только на сервере
+.env
+.env.local

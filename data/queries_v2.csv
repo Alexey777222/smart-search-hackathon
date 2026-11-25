@@ -1,0 +1,31 @@
+query,expected_ids,frequency,context,case_type
+task flo pro,SW-001,26,office,typo_short
+byte note,SW-014|SW-015,31,productivity,typo_short
+netshiel antivirus plus,SW-011,12,security,typo_short
+medieplay audio player,SW-019,10,media,typo_short
+byte note text editro,SW-014|SW-015,7,productivity,typo_short
+pixeldesk,SW-005,29,graphics,similar_names
+pixeldesk studio,SW-005|SW-006,27,graphics,similar_names
+netshield antivirus,SW-011|SW-012,22,security,similar_names
+cloud vault backup,SW-008|SW-009,18,backup,similar_names
+media play,SW-018|SW-019,16,media,similar_names
+облако синхронизация cloudvault,SW-010,14,backup,paraphrase
+облачный бэкап cloudvault pro,SW-008,11,backup,paraphrase
+менеджер паролей securepass,SW-022|SW-023,20,security,paraphrase
+редактор текста byte note,SW-014|SW-015,9,productivity,paraphrase
+генератор pdf reportgen,SW-025,17,documents,paraphrase
+облачный почтовый клиент,SW-024,8,email,paraphrase
+таскфлоу про 2024,SW-001,23,office,russian_translit
+дата рескю рекавери,SW-020|SW-021,13,recovery,russian_translit
+пиксельдеск студио,SW-005|SW-006,12,graphics,russian_translit
+медиаплей аудио плеер,SW-019,15,media,russian_wording
+taskflow pro 2025,,21,office,wrong_version
+byte note text editor x86,,10,productivity,wrong_edition
+pixeldesk studio portable x86,,9,graphics,wrong_edition
+cloudvault backup ultimate,,12,backup,wrong_edition
+datarescue recovery tool workstation,,8,recovery,wrong_edition
+облачное хранилище файлов,,11,backup,no_product
+антивирус для сервера,,13,security,no_product
+фоторедактор с слоями,,14,graphics,no_product
+видеоредактор для youtube,,16,media,no_product
+калькулятор налогов,,7,finance,no_product

@@ -1,0 +1,45 @@
+query,expected_ids,expected_note,frequency,context,case_type
+task flo pro 2024,SW-001,,26,office,typo_short
+byte note,SW-014|SW-015,,31,productivity,typo_short
+netshiel antivirus plus,SW-011,,12,security,typo_short
+medieplay audio player,SW-019,,10,media,typo_short
+byte note text editro,SW-014|SW-015,,7,productivity,typo_short
+pixeldesk,SW-005|SW-006|SW-007,,29,graphics,similar_names
+pixeldesk studio,SW-005|SW-006,,27,graphics,similar_names
+netshield antivirus,SW-011|SW-012,,22,security,similar_names
+cloud vault backup,SW-008|SW-009,,18,backup,similar_names
+media play,SW-018|SW-019,,16,media,similar_names
+облако синхронизация cloudvault,SW-010,,14,backup,paraphrase
+облачный бэкап cloudvault pro,SW-008,,11,backup,paraphrase
+менеджер паролей securepass,SW-022|SW-023,,20,security,paraphrase
+редактор текста byte note,SW-014|SW-015,,9,productivity,paraphrase
+генератор pdf reportgen,SW-025,,17,documents,paraphrase
+облачный почтовый клиент,SW-024,,8,email,paraphrase
+таскфлоу про 2024,SW-001,,23,office,russian_translit
+дата рескю рекавери,SW-020|SW-021,,13,recovery,russian_translit
+пиксельдеск студио,SW-005|SW-006,,12,graphics,russian_translit
+медиаплей аудио плеер,SW-019,,15,media,russian_wording
+taskflow pro 2025,,wrong_version,21,office,wrong_version
+byte note text editor x86,SW-014,unconfirmed_x86,10,productivity,wrong_edition
+pixeldesk studio portable x86,SW-006,unconfirmed_x86,9,graphics,wrong_edition
+cloudvault backup ultimate,SW-008|SW-009,unconfirmed_ultimate,12,backup,wrong_edition
+datarescue recovery tool workstation,SW-020|SW-021,unconfirmed_workstation,8,recovery,wrong_edition
+облачное хранилище файлов,,no_product,11,backup,no_product
+антивирус для сервера,,no_product,13,security,no_product
+фоторедактор с слоями,,no_product,14,graphics,no_product
+видеоредактор для youtube,,no_product,16,media,no_product
+калькулятор налогов,,no_product,7,finance,no_product
+codeforge ide,SW-016|SW-017,,19,development,similar_names
+cloudmail,SW-024,,10,email,short_name
+пиксельдеск лайт,SW-007,,11,graphics,russian_translit
+байтнот редактор,SW-014|SW-015,,14,productivity,russian_translit
+облачный бэкап стандарт,SW-009,,8,backup,paraphrase
+таскфлоу энтерпрайз,SW-004,,9,office,russian_translit
+cloudvault sync pro,SW-010,unconfirmed_pro,7,backup,mixed_attr
+netshield firewall free,SW-013,unconfirmed_free,6,security,mixed_attr
+медиаплей видео плеер,SW-018,,13,media,russian_wording
+кодфордж иде студент,SW-017,,10,development,russian_wording
+облачный бэкап без версии,SW-008|SW-009,unconfirmed_version,15,backup,paraphrase
+не существует продукт,,no_product,5,general,no_product
+vpn tunnel client,,no_product,8,network,no_product
+фото ретушь лица,,no_product,7,graphics,no_product

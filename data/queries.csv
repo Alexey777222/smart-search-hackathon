@@ -1,0 +1,31 @@
+query,expected_ids,frequency,context,case_type
+TaskFlow Pro 2024,SW-001,95,office,exact
+CloudVault Sync,SW-010,60,backup,exact
+NetShield Firewall,SW-013,45,security,exact
+MediaPlay Audio Player,SW-019,38,media,exact
+CodeForge IDE Professional,SW-016,52,development,exact
+SecurePass Password Manager,SW-022|SW-023,70,security,exact
+TaskFlow Pr0 2024,SW-001,30,office,typo
+PixelDesk Stduio,SW-005|SW-006,28,graphics,typo
+CouldVault Backup Pro,SW-008,22,backup,typo
+NetShield Antivirus Plsu,SW-011,15,security,typo
+ByteNoot Text Editor,SW-014|SW-015,18,productivity,typo
+ReportGen PDF Genrator,SW-025,12,documents,typo
+DataRescue Recvery Tool,SW-020|SW-021,20,recovery,typo
+securepass pwd mgr,SW-022|SW-023,25,security,abbreviation
+netshield antiv free,SW-012,17,security,abbreviation
+byte note txt editor,SW-014|SW-015,14,productivity,abbreviation
+taskflow ent,SW-004,10,office,abbreviation
+codeforge ide prof,SW-016,21,development,abbreviation
+Pro TaskFlow 2024,SW-001,13,office,word_swap
+Backup CloudVault Standard,SW-009,9,backup,word_swap
+Player Video MediaPlay,SW-018,8,media,word_swap
+Manager Password SecurePass Business,SW-023,6,security,word_swap
+TaskFlow Pro 2023,SW-002,26,office,version
+TaskFlow Home 2024,SW-003,19,office,version
+PixelDesk Lite,SW-007,16,graphics,edition
+ByteNote Text Editor x64,SW-015,11,productivity,edition
+VPN Tunnel Client,,24,network,missing
+SQL Database Server,,20,development,missing
+Music Production Studio DAW,,15,media,missing
+Photo Face Retouch,,13,graphics,missing

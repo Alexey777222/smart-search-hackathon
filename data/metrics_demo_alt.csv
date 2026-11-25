@@ -1,0 +1,7 @@
+# SYNTHETIC DATA — учебный прототип, ВАРИАНТ B. Не реальные продажи.
+# Сценарий: у CloudVault Backup Pro маржа ВЫШЕ, чем у Standard.
+# Проверяем, что обязательная редакция в запросе сильнее коммерции.
+id,purchases_30d,gross_margin_pct,data_source
+SW-008,42,72,synthetic
+SW-009,17,45,synthetic
+SW-010,12,60,synthetic

@@ -1,0 +1,29 @@
+# SYNTHETIC DATA — учебный прототип. Не реальные продажи.
+# Колонки: id товара, количество покупок за последние 30 дней,
+# валовая маржа в процентах. Пропуск = неизвестное значение.
+id,purchases_30d,gross_margin_pct,data_source
+SW-001,58,44,synthetic
+SW-002,32,42,synthetic
+SW-003,21,38,synthetic
+SW-004,15,50,synthetic
+SW-005,10,55,synthetic
+SW-006,10,60,synthetic
+SW-007,10,,synthetic
+SW-008,42,38,synthetic
+SW-009,17,68,synthetic
+SW-010,12,,synthetic
+SW-011,33,45,synthetic
+SW-012,21,52,synthetic
+SW-013,25,58,synthetic
+SW-014,40,50,synthetic
+SW-015,28,48,synthetic
+SW-016,35,62,synthetic
+SW-017,18,35,synthetic
+SW-018,25,,synthetic
+SW-019,25,58,synthetic
+SW-020,14,55,synthetic
+SW-021,9,60,synthetic
+SW-022,20,42,synthetic
+SW-023,12,40,synthetic
+SW-024,22,65,synthetic
+SW-025,16,70,synthetic

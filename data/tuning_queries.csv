@@ -1,0 +1,15 @@
+query,expected_ids,case_type
+task flo home,SW-003,typo
+netshield firwall,SW-013,typo
+cloudmail clinet,SW-024,typo
+medpla audio player,SW-019,typo
+reportgen pdf,SW-025,short
+datarescue server,SW-021,abbreviation
+pixeldesk studio portable,SW-006,exact
+securepass business,SW-023,short
+byte note editor x64,SW-015,short
+vpn client pro,,missing
+video editing suite,,missing
+spreadsheet calc tool,,missing
+game launcher online,,missing
+photo face retouch pro,,missing

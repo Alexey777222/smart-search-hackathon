@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Умный поиск Softline — стенд</title>
+<style>
+  :root {
+    --bg: #f6f7fb; --card: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e3e6ee; --accent: #2b59ff; --accent-soft: #eef2ff;
+    --ok: #0f7b4f; --warn: #a8560b; --bad: #a11b1b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  header { background: #fff; border-bottom: 1px solid var(--line); padding: 18px 0; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .bar { display: flex; gap: 10px; margin: 18px 0 6px; flex-wrap: wrap; }
+  input[type=text] { flex: 1 1 320px; padding: 11px 14px; font-size: 15px;
+        border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+  input[type=text]:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  button { padding: 11px 18px; font-size: 15px; border-radius: 10px; cursor: pointer;
+           border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+  button.ghost { background: #fff; color: var(--accent); }
+  button:disabled { opacity: .55; cursor: default; }
+  .hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  main { padding: 22px 0 60px; }
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+           padding: 18px; margin-bottom: 18px; }
+  .panel h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .04em;
+              color: var(--muted); margin: 0 0 12px; }
+  .notice { border-left: 3px solid var(--warn); background: #fff8ee; padding: 10px 12px;
+            border-radius: 8px; color: #6b4a12; font-size: 14px; margin-bottom: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .card { border: 1px solid var(--line); border-radius: 12px; padding: 14px;
+          display: flex; flex-direction: column; gap: 8px; background: #fff; }
+  .card .name { font-weight: 600; font-size: 15px; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px;
+           background: var(--accent-soft); color: #21307a; }
+  .badge.support { background: #fff2e0; color: #8a4b00; }
+  .badge.base { background: #e8f7ee; color: var(--ok); }
+  .badge.off { background: #fdeaea; color: var(--bad); }
+  .meta { font-size: 13px; color: var(--muted); }
+  .price { font-size: 17px; font-weight: 600; }
+  .why { font-size: 13px; color: #3d4452; background: #fafbff;
+         border: 1px dashed var(--line); border-radius: 8px; padding: 8px 10px; }
+  .why b { font-weight: 600; }
+  a.buy { color: var(--accent); text-decoration: none; font-size: 14px; }
+  a.buy:hover { text-decoration: underline; }
+  .empty { color: var(--muted); }
+  .chat { display: flex; flex-direction: column; gap: 10px; }
+  .msg { padding: 10px 12px; border-radius: 12px; max-width: 88%; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; }
+  .msg.bot { align-self: flex-start; background: #f3f5fb; }
+  .msg.sys { align-self: center; color: var(--muted); font-size: 13px; background: none; }
+  .chat-bar { display: flex; gap: 8px; margin-top: 6px; }
+  .chat-bar input { flex: 1; }
+  .stats { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .ai-tag { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e8f7ee; color: var(--ok); }
+  .ai-tag.mock { background: #fff2e0; color: var(--warn); }
+  .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase;
+                   letter-spacing: .05em; color: var(--muted); margin: 16px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Умный поиск Softline</h1>
+    <div class="sub" id="status">загружаю индекс…</div>
+    <div class="bar">
+      <input type="text" id="q" placeholder="Например: сервер, кибер бэкап, anydesk дополнительные устройства"
+             autocomplete="off">
+      <button id="find">Найти</button>
+      <button id="consult" class="ghost">Помочь с выбором</button>
+      <button id="voice" class="ghost" title="Нажмите и произнесите запрос">🎤 Задать голосом</button>
+    </div>
+    <p class="hint" id="voiceHint">Обычный поиск работает локально по индексу каталога.
+      «Помочь с выбором» — ИИ-консультант; без ключа работает имитация провайдера.
+      Распознанная фраза показывается перед отправкой.</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="results"></div>
+
+  <div class="panel" id="chatPanel" hidden>
+    <h2>Помочь с выбором</h2>
+    <div class="chat" id="chat"></div>
+    <div class="chat-bar">
+      <input type="text" id="chatInput" placeholder="Опишите задачу: что уже есть и что нужно">
+      <button id="send">Спросить</button>
+    </div>
+    <div class="stats" id="chatStats"></div>
+  </div>
+</main>
+
+<script>
+const state = { sessionId: "", provider: "", live: false };
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => (s ?? "").toString()
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const TYPE_CLASS = (card) => {
+  const t = card.offer_type || "unknown";
+  if (t === "base" || t === "subscription") return "base";
+  if (t === "support" || t === "renewal" || t === "crossgrade") return "support";
+  return "";
+};
+
+function cardHtml(card) {
+  const badges = [`<span class="badge ${TYPE_CLASS(card)}">${esc(card.type_label)}</span>`];
+  if (!card.available) badges.push('<span class="badge off">нет в наличии</span>');
+  if (card.platform) badges.push(`<span class="badge">${esc(card.platform)}</span>`);
+  if (card.duration && card.duration !== "Не определено")
+    badges.push(`<span class="badge">${esc(card.duration)}</span>`);
+
+  const price = card.price ? card.price_text : "Цена не указана";
+  const why = card.reason
+    ? `<div class="why"><b>Почему показан:</b> ${esc(card.reason)}</div>` : "";
+  const variants = (card.variants || []).length > 1
+    ? `<div class="meta">Вариантов в линейке: ${card.variant_count}</div>` : "";
+
+  return `<div class="card">
+    <div class="name">${esc(card.name)}</div>
+    <div class="badges">${badges.join("")}</div>
+    <div class="meta">${esc(card.vendor || "")}${card.category_path ? " · " + esc(card.category_path) : ""}</div>
+    <div class="price">${esc(price)}</div>
+    ${why}
+    ${variants}
+    <a class="buy" href="${esc(card.url)}" target="_blank" rel="noopener">Открыть на Softline →</a>
+  </div>`;
+}
+
+const SECTION_TITLES = {
+  direct: "Прямые совпадения",
+  alternative: "Альтернативы",
+  related: "Сопутствующие / другой тип предложения",
+};
+const KIND_TITLES = {
+  server_hardware: "Серверное оборудование",
+  server_component: "Комплектующие",
+  server_software: "ПО для сервера",
+};
+
+function renderSearch(data) {
+  const root = $("results");
+  let html = `<div class="panel"><h2>Результаты: ${esc(data.query)}</h2>`;
+  if (data.shortfall) {
+    html += `<div class="notice">По этому запросу в каталоге меньше 4 товаров
+      (найдено ${data.total}). Выдача не добирается дублями лицензий одной линейки.</div>`;
+  }
+  if (data.software_only) {
+    html += `<div class="notice">Запрос понят как «ПО для сервера»: показаны программы, а не железо.</div>`;
+  }
+
+  if (data.sections && Object.keys(data.sections).length) {
+    for (const [kind, cards] of Object.entries(data.sections)) {
+      html += `<div class="section-title">${esc(KIND_TITLES[kind] || kind)} (${cards.length})</div>`;
+      html += `<div class="grid">${cards.map(cardHtml).join("")}</div>`;
+    }
+  } else if (data.buckets) {
+    for (const [bucket, cards] of Object.entries(data.buckets)) {
+      html += `<div class="section-title">${esc(SECTION_TITLES[bucket] || bucket)} (${cards.length})</div>`;
+      html += `<div class="grid">${cards.map(cardHtml).join("")}</div>`;
+    }
+  } else {
+    html += `<p class="empty">Ничего не найдено.</p>`;
+  }
+  html += `<p class="hint">Просмотрено кандидатов: ${data.candidates} · найдено карточек: ${data.total}</p></div>`;
+  root.innerHTML = html;
+}
+
+async function doSearch() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("results").innerHTML = `<div class="panel"><p class="empty">Ищу…</p></div>`;
+  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+  if (!res.ok) {
+    $("results").innerHTML = `<div class="panel"><p class="empty">Ошибка поиска</p></div>`;
+    return;
+  }
+  renderSearch(await res.json());
+}
+
+function addMsg(kind, text) {
+  const div = document.createElement("div");
+  div.className = `msg ${kind}`;
+  div.textContent = text;
+  $("chat").appendChild(div);
+  div.scrollIntoView({ block: "nearest" });
+}
+
+function renderChatCards(cards) {
+  if (!cards || !cards.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "grid";
+  wrap.style.marginTop = "8px";
+  wrap.innerHTML = cards.map(cardHtml).join("");
+  $("chat").appendChild(wrap);
+}
+
+async function ensureSession() {
+  if (state.sessionId) return;
+  const res = await fetch("/api/session", { method: "POST" });
+  const data = await res.json();
+  state.sessionId = data.session_id;
+  state.provider = data.provider;
+  state.live = data.live;
+}
+
+async function sendChat() {
+  const text = $("chatInput").value.trim();
+  if (!text) return;
+  $("chatInput").value = "";
+  $("chatPanel").hidden = false;
+  addMsg("user", text);
+  const btn = $("send");
+  btn.disabled = true;
+  addMsg("sys", "консультант думает…");
+  try {
+    await ensureSession();
+    const res = await fetch("/api/consult", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: state.sessionId, message: text }),
+    });
+    const data = await res.json();
+    $("chat").lastChild?.remove();
+    if (!res.ok) { addMsg("bot", data.detail || "Ошибка консультанта"); return; }
+    addMsg("bot", data.answer);
+    renderChatCards(data.cards);
+    const mode = data.live ? "живой YandexGPT" : "имитация провайдера (ключа нет)";
+    $("chatStats").textContent =
+      `режим: ${mode} · вызовов модели: ${data.calls} · ${data.latency_ms} мс · ` +
+      `токены: ${data.usage.prompt}/${data.usage.completion} · ` +
+      `расчётно: ${data.cost_rub} ₽`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function loadStatus() {
+  try {
+    const res = await fetch("/api/health");
+    const data = await res.json();
+    const ai = data.ai_live ? "живой YandexGPT" : "имитация провайдера (ключ не задан)";
+    $("status").innerHTML =
+      `Индекс: ${data.index.offers.toLocaleString("ru-RU")} предложений, ` +
+      `${data.index.groups.toLocaleString("ru-RU")} групп · собран ${esc(data.index.built_at)} · ` +
+      `ИИ: <span class="ai-tag ${data.ai_live ? "" : "mock"}">${ai}</span>`;
+  } catch (e) {
+    $("status").textContent = "не удалось получить статус";
+  }
+}
+
+$("find").addEventListener("click", doSearch);
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+$("consult").addEventListener("click", () => {
+  $("chatPanel").hidden = false;
+  const q = $("q").value.trim();
+  if (q) { $("chatInput").value = q; }
+  $("chatInput").focus();
+});
+$("send").addEventListener("click", sendChat);
+$("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+loadStatus();
+
+// Голосовой ввод.
+// Подход к работе с микрофоном подсмотрен в проекте voise_agent
+// (MIT License, Copyright (c) 2026 kpshinnik): там захват идёт через
+// navigator.mediaDevices.getUserMedia и распознавание на бэкенде.
+// Здесь для демо используется встроенное распознавание браузера — ключ
+// внешнего ASR не нужен; при недоступности показываем понятное сообщение.
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognizing = false;
+
+function voiceHint(text, tone) {
+  const el = $("voiceHint");
+  el.textContent = text;
+  el.style.color = tone === "err" ? "#a11b1b" : (tone === "ok" ? "#0f7b4f" : "");
+}
+
+$("voice").addEventListener("click", () => {
+  if (!SR) {
+    voiceHint("Браузер не поддерживает распознавание речи. Наберите запрос текстом — " +
+              "ответ консультанта будет тем же.", "err");
+    return;
+  }
+  if (recognizing) return;
+
+  const rec = new SR();
+  rec.lang = "ru-RU";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  recognizing = true;
+  $("voice").disabled = true;
+  voiceHint("Слушаю… произнесите запрос.", "ok");
+
+  rec.onresult = (event) => {
+    const phrase = (event.results?.[0]?.[0]?.transcript || "").trim();
+    voiceHint(phrase ? `Распознано: «${phrase}» — отправляю консультанту.`
+                     : "Не расслышал, попробуйте ещё раз.",
+              phrase ? "ok" : "err");
+    if (!phrase) return;
+    $("q").value = phrase;
+    $("chatPanel").hidden = false;
+    $("chatInput").value = phrase;
+    sendChat();
+  };
+  rec.onerror = (event) => {
+    const reason = event.error === "not-allowed"
+      ? "нет доступа к микрофону — разрешите его в браузере"
+      : `ошибка распознавания: ${event.error}`;
+    voiceHint(`Голосовой ввод недоступен (${reason}). Наберите запрос текстом.`, "err");
+  };
+  rec.onend = () => {
+    recognizing = false;
+    $("voice").disabled = false;
+  };
+  try {
+    rec.start();
+  } catch (e) {
+    recognizing = false;
+    $("voice").disabled = false;
+    voiceHint("Не удалось запустить распознавание. Наберите запрос текстом.", "err");
+  }
+});
+</script>
+</body>
+</html>
