@@ -63,6 +63,18 @@
   .ai-tag.mock { background: #fff2e0; color: var(--warn); }
   .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase;
                    letter-spacing: .05em; color: var(--muted); margin: 16px 0 8px; }
+  .top4 { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .t4 { border: 1px solid var(--line); border-radius: 12px; padding: 12px;
+        background: #fff; display: flex; flex-direction: column; gap: 6px;
+        position: relative; }
+  .t4.reserve { border-style: dashed; opacity: .88; }
+  .t4 .rank { position: absolute; top: 10px; right: 12px; font-size: 12px;
+              color: var(--muted); }
+  .t4 .role { font-size: 12px; padding: 2px 8px; border-radius: 999px;
+              background: var(--accent-soft); color: #21307a; align-self: flex-start; }
+  .t4 .role.related { background: #fff2e0; color: #8a4b00; }
+  .t4 .role.analog { background: #fdeaea; color: var(--bad); }
+  .t4 .why { font-size: 12px; }
 </style>
 </head>
 <body>
@@ -147,6 +159,37 @@ const KIND_TITLES = {
   server_software: "ПО для сервера",
 };
 
+function top4Html(t) {
+  if (!t || !t.items || !t.items.length) return "";
+  let html = `<div class="section-title">Топ-4 · ${t.count} из ${t.size}</div>`;
+  if (t.reserve_note) html += `<div class="notice">${esc(t.reserve_note)}</div>`;
+  if (t.shortfall) html += `<div class="notice">${esc(t.shortfall_reason)}</div>`;
+  html += `<div class="top4">`;
+  t.items.forEach((it, i) => {
+    const roleCls = it.role === "прямое совпадение" ? ""
+      : (it.role === "сопутствующий товар" ? " related" : " analog");
+    const priceBadge = it.price
+      ? `<span class="badge">${esc(it.price_text)}</span>`
+      : `<span class="badge off">цена не указана</span>`;
+    const facts = (it.facts && it.facts.length)
+      ? `<div class="meta">${esc(it.facts.join("; "))}</div>` : "";
+    html += `<div class="t4${it.reserve ? " reserve" : ""}">
+      <span class="rank">#${i + 1}</span>
+      <div class="name">${esc(it.name)}</div>
+      <span class="role${roleCls}">${esc(it.role)}${it.reserve ? " · резерв" : ""}</span>
+      <div class="badges">
+        <span class="badge ${it.available ? "base" : "off"}">${esc(it.available_text)}</span>
+        ${priceBadge}
+      </div>
+      ${facts}
+      <div class="why"><b>Почему:</b> ${esc(it.reason || "")}</div>
+      <a class="buy" href="${esc(it.url)}" target="_blank" rel="noopener">Открыть на Softline →</a>
+    </div>`;
+  });
+  html += `</div>`;
+  return html;
+}
+
 function renderSearch(data) {
   const root = $("results");
   let html = `<div class="panel"><h2>Результаты: ${esc(data.query)}</h2>`;
@@ -163,6 +206,8 @@ function renderSearch(data) {
     html += `<div class="notice">Опечатка исправлена по словарю каталога: ${fixes}.
       Поиск выполнен по исправленным словам до ранжирования.</div>`;
   }
+
+  html += top4Html(data.top4);
 
   if (data.sections && Object.keys(data.sections).length) {
     for (const [kind, cards] of Object.entries(data.sections)) {

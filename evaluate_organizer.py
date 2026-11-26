@@ -29,6 +29,8 @@ from urllib.parse import unquote
 
 import organizer_search as osr
 from organizer_index import OFFER_TYPE_LABELS, connect, normalize_text
+from selection import (build_top4, extract_requirements, family_id,
+                       is_os_offer, verify_requirements)
 
 import config_v3
 
@@ -313,6 +315,200 @@ def suitability(entry: dict | None) -> dict:
             "note": "; ".join(notes)}
 
 
+# ── проверка топ-4 ────────────────────────────────────────────────
+#
+# Оценщик отвечает на два вопроса по топ-4:
+#   1. попало ли целевое семейство из Excel в видимый топ-4;
+#   2. что представляет собой каждая карточка топ-4: семейство, роль,
+#      наличие, цену и основание включения.
+
+def _as_entry(item: dict) -> dict:
+    """Карточка топ-4 → запись, пригодная для confirm()."""
+    return {"id": item.get("id"), "name": item.get("name"),
+            "vendor": item.get("vendor"), "url": item.get("url"),
+            "category_id": item.get("category_id"),
+            "category_path": item.get("category_path")}
+
+
+def top4_family(items: list[dict], target: dict) -> dict:
+    """Есть ли целевое семейство в топ-4 и на какой позиции."""
+    closest = {"hit": False, "position": None, "name": None,
+               "status": "НЕ подтверждено"}
+    for pos, item in enumerate(items, 1):
+        status = confirm(_as_entry(item), target)["status"]
+        if status.startswith("подтверждено"):
+            return {"hit": True, "position": pos, "name": item["name"],
+                    "status": status}
+        if closest["position"] is None and status.startswith("частично"):
+            closest = {"hit": False, "position": pos, "name": item["name"],
+                       "status": status}
+    return closest
+
+
+def top4_cards(items: list[dict]) -> list[dict]:
+    """Оценка каждой карточки видимого топ-4."""
+    out = []
+    for pos, item in enumerate(items, 1):
+        out.append({
+            "position": pos,
+            "name": item["name"],
+            "family": item.get("family_id"),
+            "role": item["role"],
+            "available": item["available"],
+            "available_text": item["available_text"],
+            "price": item["price"],
+            "price_text": item["price_text"],
+            "reserve": item.get("reserve", False),
+            "basis": item.get("reason") or "",
+            "problems": item.get("problems") or [],
+        })
+    return out
+
+
+def _top4_of(conn, query: str, limit: int = 12) -> dict:
+    result = osr.search(conn, query, limit=limit)
+    reqs = extract_requirements(
+        result.get("normalized") or result.get("effective_query") or query)
+    top = build_top4(result, reqs)
+    top["_result"] = result
+    top["_reqs"] = reqs
+    return top
+
+
+# Запросы, которых нет в Excel, но которые проверяют требования заказчика.
+_EXTRA_QUERIES = [
+    ("astra linuc", "опечатка исправлена, первой идёт Astra Linux SE с ценой"),
+    ("Найди Linux", "разговорное начало снято; в топе ОС с ценой"),
+    ("сервер", "4 разных семейства, все доступны с ценой"),
+    ("ПО для сервера", "только программы, 4 разных вендора"),
+    ("adobe photoshop 2025", "точного товара нет — показан аналог с пометкой"),
+    ("кибер бэкап без windows", "отрицание учтено, Windows-только не в топе"),
+]
+
+
+def extra_query_checks(conn) -> list[dict]:
+    out = []
+    for query, expectation in _EXTRA_QUERIES:
+        top = _top4_of(conn, query)
+        items = top["items"]
+        result = top["_result"]
+        checks = []
+        if query == "astra linuc":
+            checks.append(("опечатка исправлена",
+                           bool(result.get("corrections"))))
+            checks.append(("первая карточка — Astra Linux",
+                           bool(items) and "astra linux" in normalize_text(
+                               items[0]["name"])))
+            checks.append(("первая карточка доступна с ценой",
+                           bool(items) and items[0]["available"]
+                           and (items[0]["price"] or 0) > 0))
+        elif query == "Найди Linux":
+            checks.append(("разговорное начало снято",
+                           (result.get("effective_query") or "").lower()
+                           == "linux"))
+            checks.append(("первая карточка — ОС",
+                           bool(items) and is_os_offer(items[0])))
+            checks.append(("первая карточка доступна с ценой",
+                           bool(items) and items[0]["available"]
+                           and (items[0]["price"] or 0) > 0))
+        elif query == "сервер":
+            checks.append(("в топ-4 четыре позиции", top["count"] == 4))
+            checks.append(("все семейства разные",
+                           len({it.get("family_id") for it in items})
+                           == len(items)))
+            checks.append(("все доступны с ценой",
+                           all(it["available"] and (it["price"] or 0) > 0
+                               for it in items)))
+        elif query == "ПО для сервера":
+            checks.append(("только программы",
+                           bool(result.get("software_only"))))
+            checks.append(("в топ-4 четыре позиции", top["count"] == 4))
+            checks.append(("четыре разных вендора",
+                           len({normalize_text(it.get("vendor") or "")
+                                for it in items}) == len(items)))
+        elif query == "adobe photoshop 2025":
+            checks.append(("топ-4 не пуст (показан аналог)",
+                           top["count"] > 0))
+            checks.append(("нет точного совпадения — роль аналога",
+                           all(it["role"] == "функциональный аналог"
+                               for it in items)))
+            checks.append(("неподтверждённая версия указана в причине",
+                           all("2025" in (it.get("reason") or "")
+                               or it.get("problems") for it in items)))
+        elif query == "кибер бэкап без windows":
+            checks.append(("запрос не считается запросом про ОС",
+                           not top["_reqs"].get("wants_os")))
+            checks.append(("Windows исключён из проверенных допродаж",
+                           all("windows" not in normalize_text(
+                               it.get("platform") or "").replace(
+                                   "linux", "") or "linux" in normalize_text(
+                                       it.get("platform") or "")
+                               for it in items)))
+        out.append({
+            "query": query,
+            "expectation": expectation,
+            "count": top["count"],
+            "shortfall": top["shortfall"],
+            "shortfall_reason": top["shortfall_reason"],
+            "reserve_note": top.get("reserve_note") or "",
+            "checks": checks,
+            "passed": all(ok for _, ok in checks),
+            "items": [
+                {"position": i, "name": it["name"], "role": it["role"],
+                 "price_text": it["price_text"],
+                 "available_text": it["available_text"],
+                 "reserve": it.get("reserve", False),
+                 "reason": it.get("reason") or ""}
+                for i, it in enumerate(items, 1)
+            ],
+        })
+    return out
+
+
+# ── проверка допродаж: совместимый / несовместимый / неизвестный ──
+
+def _first_offer(conn, where: str, params: tuple):
+    row = conn.execute(
+        f"SELECT * FROM offers WHERE {where} LIMIT 1", params).fetchone()
+    return dict(row) if row else None
+
+
+def upsell_checks(conn) -> list[dict]:
+    reqs = extract_requirements("astra linux")
+    compatible = _first_offer(
+        conn, "name LIKE ? AND available=1 AND price>0",
+        ("%КриптоПро CSP для Astra Linux%",))
+    incompatible = _first_offer(
+        conn, "lower(platform)='windows' AND name NOT LIKE ?",
+        ("%Astra%",))
+    unknown = _first_offer(
+        conn, "(platform IS NULL OR platform='') AND name NOT LIKE ? "
+              "AND params_json NOT LIKE ?",
+        ("%Astra%", "%Astra%"))
+    cases = [
+        ("совместимый", compatible, True),
+        ("несовместимый (только Windows)", incompatible, False),
+        ("неизвестная характеристика", unknown, False),
+    ]
+    out = []
+    for label, offer, expected in cases:
+        if not offer:
+            out.append({"case": label, "found": False, "expected": expected,
+                        "verified": None, "name": None, "problems": []})
+            continue
+        check = verify_requirements(offer, reqs)
+        out.append({
+            "case": label, "found": True, "expected": expected,
+            "verified": check["verified"],
+            "passed": check["verified"] == expected,
+            "name": offer.get("name"),
+            "platform": offer.get("platform") or "",
+            "problems": check["problems"],
+            "facts": check["facts"],
+        })
+    return out
+
+
 # ── прогон ────────────────────────────────────────────────────────
 
 def run(queries: list[dict]) -> dict:
@@ -338,6 +534,11 @@ def run(queries: list[dict]) -> dict:
             ours_entry["type_label"] = ours_top["type_label"]
             ours_entry["reason"] = ours_top["reason"]
 
+        # Видимый топ-4 того же запроса: семейство из Excel должно попасть
+        # именно в него, а не только в общий список выдачи.
+        top4 = build_top4(result, extract_requirements(
+            result.get("normalized") or result.get("effective_query") or q))
+
         rows.append({
             "query": q,
             "expected_url": item["expected_url"],
@@ -347,6 +548,9 @@ def run(queries: list[dict]) -> dict:
             "ours_top": ours_entry,
             "ours_confirm": confirm(ours_entry, target),
             "ours_suitable": suitability(ours_entry),
+            "top4": top4,
+            "top4_family": top4_family(top4["items"], target),
+            "top4_cards": top4_cards(top4["items"]),
             "reason": divergence_reason(base_top, ours_entry),
             "candidates": result["candidates"],
             "total": result["total"],
@@ -384,7 +588,9 @@ def run(queries: list[dict]) -> dict:
     # Отдельная диагностика запроса «сервер» (не входит в 10 строк Excel).
     server = osr.search(conn, "сервер", limit=5)
     return {"rows": rows, "server": server, "pairs": pair_rows,
-            "shortfall": shortfall, "diagnostics": diagnostics}
+            "shortfall": shortfall, "diagnostics": diagnostics,
+            "extra": extra_query_checks(conn),
+            "upsell": upsell_checks(conn)}
 
 
 def _short(text: str, width: int) -> str:
@@ -495,6 +701,85 @@ def print_report(data: dict) -> str:
     L.append(f"Первое предложение пригодно для покупки с нуля: "
              f"{buy_ok}/{len(rows)}. Остальные — продление/сопровождение/"
              f"cross-grade/дополнение либо тип не указан в фиде.")
+    L.append("")
+
+    # Топ-4: попадание целевого семейства и разбор каждой карточки.
+    L.append("=" * 110)
+    L.append("ТОП-4: ПОПАДАНИЕ СЕМЕЙСТВА ИЗ EXCEL И РАЗБОР КАРТОЧЕК")
+    L.append("=" * 110)
+    hit4 = 0
+    for i, row in enumerate(rows, 1):
+        fam = row["top4_family"]
+        top4 = row["top4"]
+        if fam["hit"]:
+            hit4 += 1
+        pos = f"позиция {fam['position']}" if fam["position"] else "нет"
+        L.append(f"{i:>2}. «{row['query']}» → семейство в топ-4: "
+                 f"{'ДА' if fam['hit'] else 'НЕТ'} ({pos}), "
+                 f"карточек {top4['count']}/{top4['size']}")
+        if fam["name"]:
+            L.append(f"     ближайшая: {_short(fam['name'], 70)} — {fam['status']}")
+        for card in row["top4_cards"]:
+            L.append(f"     #{card['position']} {_short(card['name'], 62)}")
+            L.append(f"         семейство: {card['family']} | роль: {card['role']}"
+                     + (" | РЕЗЕРВ" if card["reserve"] else ""))
+            L.append(f"         наличие: {card['available_text']} | "
+                     f"цена: {card['price_text']}")
+            L.append(f"         основание: {_short(card['basis'], 100)}")
+            if card["problems"]:
+                L.append(f"         не подтверждено: "
+                         f"{_short('; '.join(card['problems']), 100)}")
+        if top4.get("reserve_note"):
+            L.append(f"     примечание: {top4['reserve_note']}")
+        if top4.get("shortfall"):
+            L.append(f"     меньше 4: {top4['shortfall_reason']}")
+        L.append("")
+    L.append(f"Целевое семейство попало в топ-4: {hit4}/{len(rows)}.")
+    L.append("")
+
+    # Дополнительные запросы: опечатка, разговорное начало, сервер,
+    # ПО для сервера, отсутствующий товар, несколько условий с отрицанием.
+    L.append("=" * 110)
+    L.append("ДОПОЛНИТЕЛЬНЫЕ ЗАПРОСЫ К ТОП-4")
+    L.append("=" * 110)
+    for check in data["extra"]:
+        mark = "PASS" if check["passed"] else "FAIL"
+        L.append(f"[{mark}] «{check['query']}» — {check['expectation']}")
+        L.append(f"     карточек {check['count']}/4"
+                 + (f"; {check['shortfall_reason']}"
+                    if check["shortfall"] else ""))
+        for text, ok in check["checks"]:
+            L.append(f"     [{'ok' if ok else 'НЕТ'}] {text}")
+        for item in check["items"]:
+            L.append(f"       #{item['position']} [{item['role']}] "
+                     f"{_short(item['name'], 58)} | {item['price_text']} | "
+                     f"{item['available_text']}"
+                     + (" | резерв" if item["reserve"] else ""))
+        L.append("")
+    extra_ok = sum(1 for c in data["extra"] if c["passed"])
+    L.append(f"Дополнительные запросы пройдено: {extra_ok}/{len(data['extra'])}.")
+    L.append("")
+
+    # Проверка допродаж по характеристикам конкретного SKU.
+    L.append("=" * 110)
+    L.append("ПРОВЕРКА ДОПРОДАЖ: СОВМЕСТИМЫЙ / НЕСОВМЕСТИМЫЙ / НЕИЗВЕСТНО")
+    L.append("=" * 110)
+    L.append("Правило: Astra Linux Special Edition; обязательное условие — "
+             "совместимость с Astra Linux.")
+    for case in data["upsell"]:
+        mark = "PASS" if case.get("passed") else "FAIL"
+        L.append(f"[{mark}] {case['case']} → ожидалось "
+                 f"{'подтверждено' if case['expected'] else 'не подтверждено'}")
+        if not case["found"]:
+            L.append("     подходящий SKU в каталоге не найден")
+            continue
+        L.append(f"     SKU: {_short(case['name'], 76)}")
+        L.append(f"     платформа: {case['platform'] or 'не указана'} | "
+                 f"факт: {'подтверждено' if case['verified'] else 'не подтверждено'}")
+        if case["problems"]:
+            L.append(f"     причина: {_short('; '.join(case['problems']), 90)}")
+    upsell_ok = sum(1 for c in data["upsell"] if c.get("passed"))
+    L.append(f"Проверки допродаж пройдено: {upsell_ok}/{len(data['upsell'])}.")
     L.append("")
 
     # Пары: общий запрос и прямой запрос про тип предложения.

@@ -409,6 +409,32 @@ def _is_software_query(query: str) -> bool:
                           normalize_text(query)))
 
 
+# ── разговорное начало запроса ────────────────────────────────────
+#
+# Текст и голос попадают в один и тот же search(). «Найди Linux» и
+# «покажи linux» должны искаться так же, как «linux»: иначе служебное
+# слово съедает покрытие и ломает ранжирование. Правило снимает только
+# ведущие повелительные/разговорные слова, остальные не трогает.
+
+_PREFIX_WORDS = (
+    "найди", "найти", "найдите", "покажи", "показать", "покажите",
+    "подбери", "подобрать", "подберите", "поищи", "поискать", "поиск",
+    "ищу", "ищем", "хочу", "хотим", "дай", "дайте", "купи", "купить",
+    "нужен", "нужна", "нужно", "нужны", "мне", "нам", "пожалуйста",
+    "плиз", "please", "show", "find", "search",
+)
+
+_PREFIX_RE = re.compile(
+    r"^(?:(?:" + "|".join(_PREFIX_WORDS) + r")\b[\s,.:;!—-]*)+", re.I)
+
+
+def strip_conversational_prefix(query: str) -> str:
+    """Снимает «найди/покажи/подбери …» в начале запроса."""
+    text = (query or "").strip()
+    cleaned = _PREFIX_RE.sub("", text).strip()
+    return cleaned or text
+
+
 def _build_group(conn: sqlite3.Connection, key: str, query: str, q_norm: str,
                  q_tokens: list[str], q_versions: set[str], intent: dict,
                  product_tokens: list[str],
@@ -693,15 +719,18 @@ def _split_for_os(groups: list[dict]) -> dict | None:
 
 def search(conn: sqlite3.Connection, query: str, limit: int = 10,
            variants_limit: int = 8) -> dict:
-    q_norm = normalize_text(query)
-    q_tokens = query_tokens(query)
+    # Один путь для текстового и голосового ввода: «Найди Linux» → «Linux».
+    effective_query = strip_conversational_prefix(query)
+    q_norm = normalize_text(effective_query)
+    q_tokens = query_tokens(effective_query)
     q_tokens, q_norm, corrections = _correct_tokens(conn, q_tokens, q_norm)
-    q_versions = _versions(query)
-    intent = detect_intent(query)
+    q_versions = _versions(effective_query)
+    intent = detect_intent(effective_query)
     score_cache: dict[str, tuple[float, dict]] = {}
     product_tokens = _product_tokens(q_tokens, intent)
     if not q_tokens:
-        return {"query": query, "groups": [], "sections": None, "buckets": None,
+        return {"query": query, "effective_query": effective_query,
+                "groups": [], "sections": None, "buckets": None,
                 "intent": intent, "candidates": 0, "total": 0, "shortfall": True}
 
     ids = _candidate_ids(conn, q_tokens)
@@ -709,11 +738,12 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
 
     # «ПО для сервера»: оставляем только программы, иначе частотное
     # «сервер» вытесняет софт железом.
-    software_only = "сервер" in q_tokens and _is_software_query(query)
+    software_only = "сервер" in q_tokens and _is_software_query(effective_query)
     if software_only:
         offers = [o for o in offers if o["kind"] == "server_software"]
         if not offers:
-            return {"query": query, "groups": [], "sections": None,
+            return {"query": query, "effective_query": effective_query,
+                    "groups": [], "sections": None,
                     "buckets": None, "intent": intent, "candidates": 0,
                     "total": 0, "shortfall": True, "software_only": True}
 
@@ -722,7 +752,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
     # лицензию поднимает менее релевантный товар выше точного совпадения.
     best_by_group: dict[str, tuple[dict, float, dict, float]] = {}
     for offer in offers:
-        s, details = score_offer(query, q_norm, q_tokens, q_versions, offer)
+        s, details = score_offer(effective_query, q_norm, q_tokens, q_versions,
+                                 offer)
         score_cache[offer["id"]] = (s, details)
         combined = s + _type_adjust(offer.get("offer_type"), intent)
         key = _group_key(offer)
@@ -737,8 +768,9 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
 
     groups = []
     for key in top_keys:
-        g = _build_group(conn, key, query, q_norm, q_tokens, q_versions, intent,
-                         product_tokens, variants_limit, score_cache)
+        g = _build_group(conn, key, effective_query, q_norm, q_tokens,
+                         q_versions, intent, product_tokens, variants_limit,
+                         score_cache)
         if not g:
             continue
         # Группа может содержать предложения разных классов: при запросе
@@ -808,6 +840,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
     total = len(groups)
     return {
         "query": query,
+        "effective_query": effective_query,
         "normalized": q_norm,
         "tokens": q_tokens,
         "corrections": corrections,

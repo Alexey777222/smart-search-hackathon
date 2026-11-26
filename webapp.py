@@ -26,6 +26,7 @@ from pydantic import BaseModel
 import organizer_search as osr
 from ai_consultant import (Catalog, Consultant, MAX_CALLS_PER_SESSION,
                            PRICE_PER_1K_TOKENS_RUB, make_card)
+from selection import build_top4, extract_requirements
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -120,8 +121,14 @@ def api_search(q: str = "", limit: int = 12):
     with DB_LOCK:
         result = osr.search(CATALOG.conn, query, limit=limit)
     cards = _cards_from_result(result, limit)
+    # Явный топ-4: обязательные условия извлекаются из исправленного
+    # запроса, чтобы «astra linuc» проверялся как «astra linux».
+    top4 = build_top4(
+        result, extract_requirements(
+            result.get("normalized") or result.get("effective_query") or query))
     return JSONResponse({
         "query": query,
+        "effective_query": result.get("effective_query", query),
         "intent": result["intent"]["name"],
         "tokens": result["tokens"],
         "corrections": result.get("corrections") or [],
@@ -129,6 +136,7 @@ def api_search(q: str = "", limit: int = 12):
         "shortfall": result["shortfall"],
         "software_only": result.get("software_only", False),
         "candidates": result["candidates"],
+        "top4": top4,
         **cards,
     })
 
