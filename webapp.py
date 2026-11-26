@@ -14,6 +14,7 @@ CLI и учебное демо (app.py, search_v3.py) не изменяются.
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -39,18 +40,43 @@ CONSULTANT = Consultant(CATALOG)
 DB_LOCK = threading.Lock()
 
 
+def _git_commit() -> dict:
+    """Коммит, из которого запущен стенд: чтобы сверять VDS с origin/main."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=5)
+        sha = (out.stdout or "").strip()
+        if not sha:
+            return {"commit": None}
+        when = subprocess.run(
+            ["git", "log", "-1", "--format=%cI"], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=5)
+        return {"commit": sha, "commit_date": (when.stdout or "").strip()}
+    except Exception:
+        return {"commit": None}
+
+
+BUILD_INFO = _git_commit()
+
+
 def _cards_from_result(result: dict, limit: int = 12) -> dict:
-    buckets: dict[str, list] = {"direct": [], "alternative": [], "related": []}
-    for group in result["groups"][:limit]:
-        card = make_card(group["best"], group["reason"], group["bucket"])
-        card["group_name"] = group["name"]
-        card["variant_count"] = group["variant_count"]
-        card["variants"] = [
-            {"id": v["id"], "name": v["name"], "type_label": v["type_label"],
-             "price": v["price"], "available": v["available"], "url": v["url"]}
-            for v in group["variants"][:4]
-        ]
-        buckets.setdefault(group["bucket"], []).append(card)
+    # Карточки собираются по секциям: иначе верхние группы с полным
+    # покрытием вытеснили бы из ответа альтернативы и сопутствующие.
+    buckets: dict[str, list] = {"direct": [], "for_os": [], "alternative": [],
+                                "related": []}
+    source = result.get("buckets") or {}
+    for bucket in buckets:
+        for group in (source.get(bucket) or [])[:limit]:
+            card = make_card(group["best"], group["reason"], group["bucket"])
+            card["group_name"] = group["name"]
+            card["variant_count"] = group["variant_count"]
+            card["variants"] = [
+                {"id": v["id"], "name": v["name"], "type_label": v["type_label"],
+                 "price": v["price"], "available": v["available"], "url": v["url"]}
+                for v in group["variants"][:4]
+            ]
+            buckets.setdefault(group["bucket"], []).append(card)
 
     sections = None
     if result.get("sections"):
@@ -62,6 +88,7 @@ def _cards_from_result(result: dict, limit: int = 12) -> dict:
                 for g in groups
             ]
     return {"buckets": {k: v for k, v in buckets.items() if v},
+            "bucket_titles": result.get("bucket_titles") or {},
             "sections": sections}
 
 
@@ -76,6 +103,7 @@ def health():
     return {
         "ok": True,
         "index": stats,
+        **BUILD_INFO,
         "ai_provider": CONSULTANT.provider.name,
         "ai_live": CONSULTANT.provider.name == "yandexgpt",
         "ai_max_calls_per_session": MAX_CALLS_PER_SESSION,
@@ -96,6 +124,7 @@ def api_search(q: str = "", limit: int = 12):
         "query": query,
         "intent": result["intent"]["name"],
         "tokens": result["tokens"],
+        "corrections": result.get("corrections") or [],
         "total": result["total"],
         "shortfall": result["shortfall"],
         "software_only": result.get("software_only", False),

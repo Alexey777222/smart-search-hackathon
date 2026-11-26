@@ -517,10 +517,185 @@ def _fill_from_category(conn: sqlite3.Connection, anchor: dict, query: str,
     return out
 
 
+# ── однозначные опечатки в токенах запроса ────────────────────────
+#
+# Правило общее и опирается на данные каталога, а не на конкретный запрос.
+# Если слова запроса нет в словаре индекса, ищем в словаре слово, которое
+# ближе всех по числу правок (не больше двух) и встречается заметно чаще
+# остальных равноудалённых кандидатов — такая замена однозначна. Правка
+# применяется ДО набора кандидатов, ранжирования и разнесения по секциям,
+# поэтому покрытие считается уже исправленным словом: «astra linuc»
+# ищется как «astra linux» и попадает в прямые совпадения.
+#
+# Усечение основы опечаткой не считается: «крипто» → «крипт» не правим.
+
+_VOCAB_CACHE: dict[int, tuple] = {}
+_MIN_FIX_LEN = 4
+_MIN_FIX_FREQ = 100
+_FIX_DOMINANCE = 3.0
+_MAX_FIX_DISTANCE = 2
+
+
+def _vocab(conn: sqlite3.Connection) -> dict:
+    """Частоты токенов индекса, разложенные по длине (кеш на соединение)."""
+    cached = _VOCAB_CACHE.get(id(conn))
+    if cached is not None and cached[0] is conn:
+        return cached[1]
+    freq: dict[str, int] = {}
+    by_len: dict[int, list[tuple[str, int, frozenset]]] = {}
+    for token, count in conn.execute(
+            "SELECT token, COUNT(*) FROM offer_tokens GROUP BY token"):
+        freq[token] = count
+        by_len.setdefault(len(token), []).append(
+            (token, count, frozenset(token)))
+    data = {"freq": freq, "by_len": by_len}
+    _VOCAB_CACHE[id(conn)] = (conn, data)
+    return data
+
+
+def _edit_distance(a: str, b: str, cap: int) -> int:
+    """Расстояние Левенштейна с ранним выходом за предел cap."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        row_min = i
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+            if cur[j] < row_min:
+                row_min = cur[j]
+        if row_min > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def _fix_token(token: str, vocab: dict) -> tuple[str, int] | None:
+    """Однозначное исправление токена по словарю индекса (или None)."""
+    if token in vocab["freq"] or len(token) < _MIN_FIX_LEN:
+        return None
+    variants = [token]
+    # Русское написание продукта сверяем и в латинской записи:
+    # «линукс» → «linuks» → «linux».
+    latin = config_v3.transliterate(token)
+    if latin and latin != token:
+        variants.append(latin)
+
+    best: tuple[int, int, str] | None = None
+    for variant in variants:
+        found: list[tuple[int, int, str]] = []
+        for length in range(len(variant) - _MAX_FIX_DISTANCE,
+                            len(variant) + _MAX_FIX_DISTANCE + 1):
+            for cand, count, chars in vocab["by_len"].get(length, ()):
+                if count < 5:
+                    continue
+                if len(chars & set(variant)) < len(variant) - _MAX_FIX_DISTANCE:
+                    continue
+                dist = _edit_distance(variant, cand, _MAX_FIX_DISTANCE)
+                if dist <= _MAX_FIX_DISTANCE:
+                    found.append((dist, -count, cand))
+        if not found:
+            continue
+        found.sort()
+        top = found[0]
+        same = [x for x in found if x[0] == top[0]]
+        runner_up = -same[1][1] if len(same) > 1 else 0
+        count = -top[1]
+        if count < _MIN_FIX_FREQ:
+            continue
+        if runner_up and count < _FIX_DOMINANCE * runner_up:
+            continue
+        # Усечённая основа — это стемминг, а не опечатка.
+        if top[2].startswith(variant) or variant.startswith(top[2]):
+            continue
+        if best is None or (top[0], top[1]) < (best[0], best[1]):
+            best = (top[0], top[1], top[2])
+    if best is None:
+        return None
+    return best[2], best[0]
+
+
+def _correct_tokens(conn: sqlite3.Connection, q_tokens: list[str],
+                    q_norm: str) -> tuple[list[str], str, list[dict]]:
+    """Исправляет однозначные опечатки до ранжирования."""
+    vocab = _vocab(conn)
+    tokens: list[str] = []
+    notes: list[dict] = []
+    for token in q_tokens:
+        hit = _fix_token(token, vocab)
+        if hit:
+            notes.append({"from": token, "to": hit[0], "distance": hit[1]})
+            tokens.append(hit[0])
+        else:
+            tokens.append(token)
+    fixed_norm = q_norm
+    for note in notes:
+        fixed_norm = fixed_norm.replace(note["from"], note["to"])
+    return tokens, fixed_norm, notes
+
+
+# ── товары «для этой ОС» отдельной секцией ────────────────────────
+#
+# Правило по данным каталога: если лучшее прямое совпадение — операционная
+# система, то предложения, в названии которых эта ОС указана как платформа
+# («… для Astra Linux», «… в комплекте с Astra Linux»), — это товары и
+# дополнения для неё, а не сама ОС. Они уходят в отдельную секцию, чтобы
+# прямой ответ не смешивался с сопутствующими продуктами.
+
+_OS_CATEGORY_MARK = "операционные системы"
+_GENERIC_NAME_TOKENS = {
+    "лиценз", "для", "на", "год", "мес", "верси", "редакц", "сертификат",
+    "подписк", "шт", "электронн", "коробочн", "по",
+}
+
+
+def _leading_tokens(name: str, limit: int = 2) -> list[str]:
+    """Ведущие слова названия без служебных слов лицензий (в порядке текста)."""
+    out: list[str] = []
+    for word in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", name or ""):
+        for token in sorted(tokenize(word)):
+            if token in _GENERIC_NAME_TOKENS or len(token) < 2:
+                continue
+            out.append(token)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _split_for_os(groups: list[dict]) -> dict | None:
+    """Переносит товары «для <ОС>» в отдельную секцию. Возвращает заголовок."""
+    core = next((g for g in groups if g["bucket"] == "direct"), None)
+    if core is None:
+        return None
+    category = normalize_text(core["best"].get("category_path") or "")
+    if not category.startswith(_OS_CATEGORY_MARK):
+        return None
+    core_tokens = _leading_tokens(core["name"])
+    if len(core_tokens) < 2:
+        return None
+    for group in groups:
+        if group is core or group["bucket"] not in ("direct", "alternative"):
+            continue
+        offer = group["best"]
+        text_tokens = tokenize_cached(" ".join((
+            offer.get("name") or "", offer.get("vendor") or "",
+            offer.get("category_path") or "")))
+        if not all(t in text_tokens for t in core_tokens):
+            continue
+        if _leading_tokens(offer.get("name") or "") == core_tokens:
+            continue  # другое издание той же ОС — остаётся прямым совпадением
+        group["bucket"] = "for_os"
+        group["reason"] = (f"товар/дополнение для «{core['name']}»: "
+                           f"эта ОС указана в названии предложения")
+    return {"for_os": f"Товары и дополнения для {core['name']}"}
+
+
 def search(conn: sqlite3.Connection, query: str, limit: int = 10,
            variants_limit: int = 8) -> dict:
     q_norm = normalize_text(query)
     q_tokens = query_tokens(query)
+    q_tokens, q_norm, corrections = _correct_tokens(conn, q_tokens, q_norm)
     q_versions = _versions(query)
     intent = detect_intent(query)
     score_cache: dict[str, tuple[float, dict]] = {}
@@ -614,7 +789,12 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
                     kind_filter="server_software" if software_only else None)
                 groups.extend(extra2)
 
-    buckets = {"direct": [], "alternative": [], "related": []}
+    # Товары «для этой ОС» — отдельной секцией, сама ОС остаётся в прямых.
+    # Порядок groups остаётся по релевантности: первый элемент — лучший ответ
+    # на запрос, независимо от того, в какую секцию он попал.
+    bucket_titles = _split_for_os(groups) or {}
+
+    buckets = {"direct": [], "for_os": [], "alternative": [], "related": []}
     for g in groups:
         buckets.setdefault(g["bucket"], []).append(g)
 
@@ -630,6 +810,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
         "query": query,
         "normalized": q_norm,
         "tokens": q_tokens,
+        "corrections": corrections,
         "versions": sorted(q_versions),
         "intent": intent,
         "software_only": software_only,
@@ -638,6 +819,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
         "shortfall": total < 4,
         "groups": groups[: max(limit, 4)],
         "buckets": {k: v[: max(limit, 4)] for k, v in buckets.items() if v},
+        "bucket_titles": bucket_titles,
         "sections": sections,
     }
 

@@ -137,6 +137,7 @@ function cardHtml(card) {
 
 const SECTION_TITLES = {
   direct: "Прямые совпадения",
+  for_os: "Товары и дополнения для этой ОС",
   alternative: "Альтернативы",
   related: "Сопутствующие / другой тип предложения",
 };
@@ -156,6 +157,12 @@ function renderSearch(data) {
   if (data.software_only) {
     html += `<div class="notice">Запрос понят как «ПО для сервера»: показаны программы, а не железо.</div>`;
   }
+  if (data.corrections && data.corrections.length) {
+    const fixes = data.corrections
+      .map(c => `«${esc(c.from)}» → «${esc(c.to)}»`).join(", ");
+    html += `<div class="notice">Опечатка исправлена по словарю каталога: ${fixes}.
+      Поиск выполнен по исправленным словам до ранжирования.</div>`;
+  }
 
   if (data.sections && Object.keys(data.sections).length) {
     for (const [kind, cards] of Object.entries(data.sections)) {
@@ -164,7 +171,9 @@ function renderSearch(data) {
     }
   } else if (data.buckets) {
     for (const [bucket, cards] of Object.entries(data.buckets)) {
-      html += `<div class="section-title">${esc(SECTION_TITLES[bucket] || bucket)} (${cards.length})</div>`;
+      const title = (data.bucket_titles && data.bucket_titles[bucket])
+        || SECTION_TITLES[bucket] || bucket;
+      html += `<div class="section-title">${esc(title)} (${cards.length})</div>`;
       html += `<div class="grid">${cards.map(cardHtml).join("")}</div>`;
     }
   } else {
