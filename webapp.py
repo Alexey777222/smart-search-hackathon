@@ -133,7 +133,8 @@ def api_search(q: str = "", limit: int = 12):
     # Явный топ-4: обязательные условия извлекаются из исправленного
     # запроса, чтобы «astra linuc» проверялся как «astra linux».
     top4 = build_top4(
-        result, extract_requirements(
+        result, result.get("requirements")
+        or extract_requirements(
             result.get("normalized") or result.get("effective_query") or query))
     return JSONResponse({
         "query": query,

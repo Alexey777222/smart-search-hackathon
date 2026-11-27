@@ -24,6 +24,7 @@ import json
 import re
 
 import organizer_search as osr
+import sku_rules
 from organizer_index import OFFER_TYPE_LABELS, normalize_text
 
 TOP4_SIZE = 4
@@ -123,6 +124,25 @@ _NEGATION_RE = re.compile(
 
 _WINDOWS_WORDS = {"windows", "виндовс", "win"}
 
+# Назначение из запроса: что именно покупатель собирается защищать.
+_SERVER_WORDS = re.compile(r"сервер|серверн")
+_WORKSTATION_WORDS = re.compile(
+    r"рабоч\w*\s+станци|ноутбук|рабоч\w*\s+мест|(?:^|\s)пк(?:\s|$)")
+
+# Что нужно восстанавливать. Уточняется вопросом консультанта.
+_SCOPE_FULL_SERVER = re.compile(
+    r"весь\s+сервер|образ\s+сервера|сервер\s+целиком|системн\w*\s+образ|"
+    r"полн\w*\s+восстановлен|всего\s+сервер")
+_SCOPE_FILES = re.compile(r"отдельн\w*\s+файл|файл\w*|файлов\w*")
+_SCOPE_DIRECTORY = re.compile(
+    r"\bald\b|ald\s*pro|служб\w*\s+каталог\w*|объект\w*\s+каталог\w*|"
+    r"active\s+directory|домен\w*\s+каталог")
+
+# Сервер уже куплен: покупать железо не нужно.
+_SERVER_OWNED = re.compile(
+    r"(?:сервер|серверн\w*)[^.!?]{0,30}(?:уже\s+есть|есть|имеется|куплен)|"
+    r"(?:уже\s+есть|есть|имеется)\s+(?:\w+\s+){0,2}сервер")
+
 
 # ── извлечение обязательных условий из запроса ────────────────────
 
@@ -176,6 +196,34 @@ def extract_requirements(query: str) -> dict:
         if rx.search(positive):
             reqs["license_type"] = name
             break
+
+    # Назначение: сервер или рабочая станция. Нужно, чтобы артикул
+    # «для рабочей станции Windows» не считался подходящим серверу.
+    reqs["role"] = None
+    if _SERVER_WORDS.search(positive):
+        reqs["role"] = "server"
+    elif _WORKSTATION_WORDS.search(positive):
+        reqs["role"] = "workstation"
+
+    # Что восстанавливать: влияет на подбор средства резервного копирования.
+    reqs["restore_scope"] = None
+    if _SCOPE_FULL_SERVER.search(positive):
+        reqs["restore_scope"] = "full_server"
+    elif _SCOPE_DIRECTORY.search(positive):
+        reqs["restore_scope"] = "directory"
+    elif _SCOPE_FILES.search(positive):
+        reqs["restore_scope"] = "files"
+
+    # Версия ALD Pro: нужна для точного выбора средства восстановления
+    # объектов каталога. Если её нет в запросе, это надо уточнить.
+    reqs["ald_version"] = None
+    ald = re.search(r"ald\s*pro(?:\s*(?:версии|версия|v))?\s*(\d+(?:\.\d+)*)",
+                    positive)
+    if ald:
+        reqs["ald_version"] = ald.group(1)
+
+    # Сервер уже куплен — железо не предлагаем.
+    reqs["server_owned"] = bool(_SERVER_OWNED.search(positive))
 
     return reqs
 
@@ -234,28 +282,23 @@ def is_os_offer(offer: dict) -> bool:
 
 
 def platform_conflict(offer: dict, reqs: dict) -> str:
-    """Явный конфликт платформы конкретного SKU с обязательной ОС.
+    """Явный конфликт платформы конкретного артикула с обязательной ОС.
 
-    Возвращает причину конфликта или пустую строку. Пустая или смешанная
+    Проверяется название артикула, затем общее поле `platform`: смешанная
     платформа («Linux/Windows») конфликтом не считается — это неизвестная
     характеристика, а не подтверждённая совместимость.
     """
     rule = _RULES_BY_ID.get((reqs or {}).get("os_rule") or "")
     if not rule or rule.get("kind") != "os":
         return ""
-    want = rule.get("platform_family")
-    if not want:
-        return ""
-    platform = normalize_text(offer.get("platform") or "")
-    if not platform:
-        return ""
-    present = {name for name, aliases in _PLATFORM_FAMILIES.items()
-               if any(alias in platform for alias in aliases)}
-    # «Windows» без Linux — единственная платформа SKU.
-    if present == {"windows"} and want == "linux":
-        return (f"платформа SKU — только Windows, а требуется "
-                f"«{rule['product']}»")
-    return ""
+    return sku_rules.platform_conflict(offer, {**(reqs or {}),
+                                              "os_rule_obj": rule})
+
+
+def sku_conflict(offer: dict, reqs: dict) -> str:
+    """Причина, по которой конкретный артикул не подходит. Пусто — годится."""
+    rule = _RULES_BY_ID.get((reqs or {}).get("os_rule") or "")
+    return sku_rules.sku_conflict(offer, {**(reqs or {}), "os_rule_obj": rule})
 
 
 # ── проверка обязательных характеристик SKU ───────────────────────
@@ -287,21 +330,37 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
                 return {"verified": False, "facts": facts,
                         "problems": problems, "conflict": True, "rule": rule}
 
-    # 0б. Явный платформенный конфликт проверяется ниже, после поиска
-    # подтверждения ОС: название SKU («… для Astra Linux») сильнее общего
-    # поля платформы.
+    # 0б. Ограничения конкретного артикула: ОС в названии, назначение
+    # (сервер / рабочая станция), объект восстановления. Проверяются до
+    # группировки в семейства: «Кибер Бэкап …, для рабочей станции Windows»
+    # не годится серверу, даже если поле платформы — Linux/Windows.
+    sku_reason = sku_conflict(offer, reqs or {})
+    if sku_reason:
+        problems.append(sku_reason)
+        return {"verified": False, "facts": facts, "problems": problems,
+                "conflict": True, "rule": rule}
+
+    # 0в. Восстановление объектов каталога: назначение подтверждено
+    # названием артикула (иначе sku_conflict уже отбраковал бы), но версия
+    # ALD Pro для точной совместимости обычно не указана — это уточняется.
+    if (reqs or {}).get("restore_scope") == "directory":
+        facts.append("в названии артикула заявлено резервное копирование и "
+                     "гранулярное восстановление объектов каталога")
+        if not (reqs or {}).get("ald_version"):
+            problems.append("версия ALD Pro в запросе не указана — уточните "
+                            "совместимость с вашей версией каталога")
 
     # 1. ОС из запроса.
     if rule:
         alias = _alias_hit(offer, rule.get("evidence") or rule["aliases"])
         if not alias:
-            # Подтверждения в данных SKU нет. Если платформа явно только
-            # Windows, а нужна Linux-ОС — это конфликт, а не «неизвестно».
-            conflict = platform_conflict(offer, reqs or {})
-            problems.append(conflict or
-                            f"совместимость с «{rule['product']}» не подтверждена")
+            # Подтверждения в данных SKU нет. Если артикул явно ограничен
+            # другой платформой — это конфликт (проверен выше), иначе
+            # характеристика просто неизвестна.
+            problems.append(
+                f"совместимость с «{rule['product']}» не подтверждена")
             return {"verified": False, "facts": facts, "problems": problems,
-                    "conflict": bool(conflict), "rule": rule}
+                    "conflict": False, "rule": rule}
         facts.append(f"ОС «{rule['product']}» указана в данных SKU")
 
         # 2. Версия ОС (если запрошена явно).
@@ -390,6 +449,18 @@ def _requirement_summary(reqs: dict) -> str:
     if reqs.get("license_type"):
         parts.append(OFFER_TYPE_LABELS.get(reqs["license_type"],
                                           reqs["license_type"]))
+    if reqs.get("role") == "server":
+        parts.append("серверная лицензия")
+    elif reqs.get("role") == "workstation":
+        parts.append("рабочая станция")
+    scope = reqs.get("restore_scope")
+    if scope:
+        parts.append({"full_server": "восстановление всего сервера",
+                      "files": "восстановление отдельных файлов",
+                      "directory": "восстановление объектов каталога"}
+                     .get(scope, scope))
+    if reqs.get("server_owned"):
+        parts.append("сервер уже есть — железо не требуется")
     return "; ".join(parts)
 
 
@@ -477,6 +548,12 @@ def _entry(group: dict, role: str, reason: str, verification: dict | None) -> di
         "facts": (verification or {}).get("facts") or [],
         "problems": (verification or {}).get("problems") or [],
     }
+    # Ограничение лицензии из названия артикула: «для образовательных
+    # организаций» — применимость зависит от типа покупателя.
+    full_name = normalize_text(offer.get("name") or "")
+    if "образовательн" in full_name:
+        entry["limitation"] = ("лицензия для образовательных организаций — "
+                               "применимость требует уточнения типа покупателя")
     rule = (verification or {}).get("rule")
     if rule:
         entry["rule"] = {"id": rule["id"], "scope": rule["scope"],
@@ -713,6 +790,12 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         core = _core_tokens(result)
 
         def analog_role(group, _verification):
+            # Восстановление объектов каталога: всё, что прошло отбраковку
+            # по названию артикула, — это и есть средство под задачу, а не
+            # «аналог» постороннего товара.
+            if (reqs.get("restore_scope") == "directory"
+                    and not sku_conflict(group["best"], reqs)):
+                return ROLE_DIRECT
             hay = _haystack(group["best"])
             if core and all(t in hay for t in core):
                 return ROLE_DIRECT

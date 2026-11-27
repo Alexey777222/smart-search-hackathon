@@ -29,7 +29,7 @@ import httpx
 
 import organizer_search as osr
 from organizer_index import (OFFER_TYPE_LABELS, STOPWORDS, connect, get_offer,
-                             get_meta, normalize_text, query_tokens)
+                             get_meta, normalize_text, query_tokens, tokenize)
 from selection import COMPAT_RULES, build_top4, extract_requirements
 from query_normalize import layout_note
 
@@ -132,8 +132,9 @@ class Catalog:
             "schema_version": meta.get("schema_version", ""),
         }
 
-    def search(self, query: str, limit: int = 6) -> dict:
-        result = osr.search(self.conn, query, limit=max(limit, 4))
+    def search(self, query: str, limit: int = 6,
+               reqs: dict | None = None) -> dict:
+        result = osr.search(self.conn, query, limit=max(limit, 4), reqs=reqs)
         cards = []
         for group in result["groups"][:limit]:
             cards.append(make_card(group["best"], group["reason"],
@@ -378,17 +379,30 @@ def _merge_requirements(server: dict, model: dict, previous: dict | None) -> dic
 
     Локальные (regex) условия приоритетнее модельных. Версии из прошлой
     реплики переносятся только для той же ОС — так «Astra Linux 1.7»
-    не теряется при уточнении задачи.
+    не теряется при уточнении задачи. Роль, объём восстановления и факт
+    «сервер уже есть» сохраняются в сессии: они не зависят от формулировки
+    текущего сообщения, если пользователь не поменял задачу.
     """
     previous = previous or {}
     reqs = {
-        "os": server.get("os") or model.get("os"),
+        "os": (server.get("os") or model.get("os")
+               or previous.get("os")),
         "os_rule": None,
         "version": [],
         "arch": server.get("arch") or model.get("arch"),
         "license_type": server.get("license_type") or model.get("license_type"),
         "exclude": list(server.get("exclude") or []),
         "wants_os": bool(server.get("wants_os") or model.get("wants_os")),
+        "role": (server.get("role") or model.get("role")
+                 or previous.get("role")),
+        "restore_scope": (server.get("restore_scope")
+                          or model.get("restore_scope")
+                          or previous.get("restore_scope")),
+        "server_owned": bool(server.get("server_owned")
+                             or previous.get("server_owned")),
+        "ald_version": (server.get("ald_version") or model.get("ald_version")
+                        or previous.get("ald_version")),
+        "clarify_asked": bool(previous.get("clarify_asked")),
     }
     for rule in COMPAT_RULES:
         if rule["kind"] == "os" and reqs["os"] == rule["product"]:
@@ -459,6 +473,24 @@ def _introduced_brand(query: str, message: str, conn) -> str:
     return ""
 
 
+def _named_brand(query: str, message: str, conn) -> bool:
+    """Пользователь сам назвал бренд в реплике?"""
+    q_tokens = set(query_tokens(query))
+    if not q_tokens:
+        return False
+    msg = normalize_text(message)
+    brand_tokens = _vendor_tokens(conn)
+    for token in q_tokens:
+        if token in _BRAND_STOP_TOKENS:
+            continue
+        # Вендор в индексе может быть длиннее токена: «кибер» → «киберпротект».
+        if any(token in brand or brand in token
+               for brand in brand_tokens if len(brand) >= 3) \
+                and token in msg:
+            return True
+    return False
+
+
 def _intent_query(message: str) -> str:
     """Запрос по исходному намерению без бренда и уточнений.
 
@@ -483,6 +515,59 @@ def _intent_queries(message: str) -> list[str]:
     if "антивирус" in low or "защит" in low:
         return ["антивирус"]
     return []
+
+
+def _drop_conditions(text: str, reqs: dict) -> str:
+    """Убирает из query токены ОС/версии/арх, которые уже учтены в reqs.
+
+    Модель иногда подмешивает «Astra Linux 1.7» в поисковый запрос —
+    это дублирует обязательные условия, которые уже извлечены в reqs.
+    """
+    drop: set[str] = set()
+    os_val = (reqs.get("os") or "").lower().replace("ё", "е")
+    if os_val:
+        drop |= set(os_val.split())
+        drop |= set(tokenize(os_val))
+    for v in reqs.get("version") or []:
+        s = str(v).lower()
+        drop.add(s)
+        drop |= set(s.split("."))
+    arch = (reqs.get("arch") or "").lower().replace("ё", "е")
+    if arch:
+        drop |= set(arch.split())
+    words: list[str] = []
+    for w in (text or "").split():
+        low = w.lower().replace("ё", "е").strip(".,;:()!? ")
+        if low in drop:
+            continue
+        if tokenize(low) and tokenize(low) <= drop:
+            continue
+        words.append(w)
+    return " ".join(words) or text
+
+
+def _keep_user_tokens(base: str, query: str, message: str, reqs: dict) -> str:
+    """К категории-намерению добавляет токены из query, которые пользователь
+    произнёс сам (бренды, артикулы, архитектуры), но не условия ОС."""
+    drop: set[str] = set()
+    for part in (reqs.get("os"), reqs.get("arch")):
+        if part:
+            drop |= set(tokenize((part or "").lower().replace("ё", "e")))
+    for v in reqs.get("version") or []:
+        drop.add(str(v).lower())
+    extra: list[str] = []
+    for w in query.split():
+        low = w.lower().replace("ё", "e").strip(".,;:()!? ")
+        if not low or low in base.lower():
+            continue
+        if low in drop:
+            continue
+        if low not in (message or "").lower():
+            continue
+        if low in STOPWORDS or len(low) < 2:
+            continue
+        extra.append(w)
+    return (base + " " + " ".join(extra)).strip() if extra else base
 
 
 _BUCKET_PRIORITY = {"direct": 0, "for_os": 1, "related": 2, "alternative": 3}
@@ -799,6 +884,13 @@ def _keep_latin(base: str, text: str) -> str:
     return " ".join([base, *extra]).strip() if extra else base
 
 
+_BACKUP_INTENT_RE = re.compile(r"резервн|бэкап|backup|восстановлен", re.I)
+
+# Один уточняющий вопрос, если задача — восстановление, но не назван объект.
+CLARIFY_RESTORE_SCOPE = ("Что нужно восстанавливать — весь сервер, отдельные "
+                         "файлы или объекты службы каталогов ALD Pro?")
+
+
 def _mock_query(text: str) -> tuple[str, str]:
     """Запрос к каталогу и, если нужно, один короткий вопрос.
 
@@ -807,6 +899,12 @@ def _mock_query(text: str) -> tuple[str, str]:
     только если пользователь назвал его сам.
     """
     low = (text or "").lower().replace("ё", "е")
+    # Восстановление объектов каталога (ALD Pro / Active Directory) —
+    # отдельная задача: ищем средство восстановления, а не лицензию
+    # на сам каталог.
+    if "ald" in low or "active directory" in low or (
+            "объект" in low and "каталог" in low):
+        return "резервное копирование объектов каталога ALD Pro", ""
     if "резервн" in low or "бэкап" in low or "backup" in low:
         if "кибер" in low:
             return "кибер бэкап", ""
@@ -902,7 +1000,8 @@ class Consultant:
         if name == "search_catalog":
             query = str(args.get("query") or "")
             limit = int(args.get("limit") or 6)
-            payload = self.catalog.search(query, limit)
+            payload = self.catalog.search(query, limit,
+                                          reqs=session.requirements or None)
             session.intent = payload["intent"]
             if payload["cards"]:
                 session.product = payload["cards"][0]
@@ -972,30 +1071,106 @@ class Consultant:
             local_query, _ = _mock_query(message)
             query = local_query or message
 
-        # Бренд, введённый моделью, но не названный пользователем —
-        # не сужаем поиск: ищем по категории и синонимам.
-        brand = _introduced_brand(query, message, self.catalog.conn)
-        search_queries = [query]
-        if brand:
-            intent_q = _intent_query(message)
-            if intent_q:
-                search_queries = [intent_q]
+        reqs = _merge_requirements(server_reqs,
+                                   extracted.get("requirements") or {},
+                                   previous)
+
+        # Один уточняющий вопрос: задача — восстановление, а объект не назван.
+        # ОС, версия и «сервер уже есть» уже лежат в reqs и сохраняются в
+        # сессии, поэтому следующая реплика («весь сервер» / «ALD Pro»)
+        # продолжит подбор, а не начнёт его заново. Не задаём вопрос, если
+        # пользователь сам назвал конкретный продукт: «Нужен Кибер Бэкап».
+        if (_BACKUP_INTENT_RE.search(message)
+                and not reqs.get("restore_scope")
+                and not previous.get("restore_scope")
+                and not previous.get("clarify_asked")
+                and not _named_brand(query, message, self.catalog.conn)):
+            reqs["clarify_asked"] = True
+            session.requirements = reqs
+            session.messages.append({"role": "assistant",
+                                     "content": CLARIFY_RESTORE_SCOPE})
+            elapsed = round((time.perf_counter() - started) * 1000)
+            return {
+                "answer": CLARIFY_RESTORE_SCOPE,
+                "cards": [],
+                "top4": {"items": [], "count": 0, "verified_count": 0,
+                         "size": 4, "strict_os": bool(reqs.get("os")),
+                         "needs_check": [], "needs_check_note": "",
+                         "no_confirmed_message": "", "shortfall": True,
+                         "shortfall_reason": "нужно уточнить объект "
+                                             "восстановления",
+                         "requirements": {
+                             "os": reqs.get("os"),
+                             "version": reqs.get("version") or [],
+                             "arch": reqs.get("arch"),
+                             "license_type": reqs.get("license_type"),
+                             "wants_os": reqs.get("wants_os", False),
+                             "summary": ""}},
+                "clarification": True,
+                "provider": self.provider.name,
+                "model": getattr(self.provider, "model", ""),
+                "live": used_model,
+                "used_model": used_model,
+                "fallback_reason": fallback_reason,
+                "session": session.id,
+                "context": session.context_summary(),
+                "query": "",
+                "requirements": {key: reqs.get(key) for key in
+                                 ("os", "version", "arch", "license_type",
+                                  "wants_os", "role", "restore_scope",
+                                  "server_owned")},
+                "verified_count": 0,
+                "needs_check_count": 0,
+                "no_confirmed_message": "",
+                "calls": calls,
+                "latency_ms": elapsed,
+                "usage": dict(session.usage),
+                "api_usage": api_usage,
+                "cost": None,
+                "cost_rub": None,
+            }
+
+        # Ответ на уточняющий вопрос: объект восстановления назван, поэтому
+        # ищем средство под эту задачу, а не «сервер»/«ALD Pro» как товар.
+        if previous.get("clarify_asked") and reqs.get("restore_scope"):
+            if reqs["restore_scope"] == "directory":
+                query = "резервное копирование объектов каталога ALD Pro"
             else:
-                local_q, _ = _mock_query(message)
-                search_queries = [local_q or message]
-        if not brand:
-            # Синонимы добавляем всегда, когда бренд не назван пользователем:
-            # «резервное копирование» и «бэкап» — одна задача.
+                query = "резервное копирование"
+
+        # Что искать: намерение пользователя важнее формулировки модели.
+        intent_q = _intent_query(message)
+        brand = _introduced_brand(query, message, self.catalog.conn)
+        user_named = _named_brand(query, message, self.catalog.conn)
+
+        if brand:
+            # Модель сузила общий запрос до бренда, которого пользователь
+            # не называл, — откат к намерению, поиск по категории.
+            local_q, _ = _mock_query(message)
+            base_query = intent_q or local_q or message
+        elif user_named:
+            # Бренд произнёс сам пользователь — он и задаёт поиск.
+            base_query = query
+        elif intent_q:
+            # Намерение есть, бренд не назван: база — намерение, из запроса
+            # модели оставляем только произнесённые пользователем названия и
+            # артикулы. Условия ОС уже учтены в reqs и в query не нужны.
+            base_query = _keep_user_tokens(
+                intent_q, _drop_conditions(query, reqs), message, reqs)
+        else:
+            base_query = query
+
+        search_queries = [base_query]
+        if not user_named:
+            # Без явного бренда ищем по категории и синонимам: «резервное
+            # копирование», «бэкап» и «backup» — одна задача, а разные
+            # формулировки дают разных производителей.
             for synonym in _intent_queries(message):
                 if synonym not in search_queries:
                     search_queries.append(synonym)
         query = search_queries[0]
 
-        reqs = _merge_requirements(server_reqs,
-                                   extracted.get("requirements") or {},
-                                   previous)
-
-        results = [osr.search(self.catalog.conn, q, limit=12)
+        results = [osr.search(self.catalog.conn, q, limit=12, reqs=reqs)
                    for q in search_queries]
         result = _merge_search_results(results)
         top4 = build_top4(result, reqs)
@@ -1041,7 +1216,8 @@ class Consultant:
             "query": query,
             "requirements": {key: reqs.get(key) for key in
                              ("os", "version", "arch", "license_type",
-                              "wants_os")},
+                              "wants_os", "role", "restore_scope",
+                              "server_owned")},
             "verified_count": top4.get("verified_count", len(confirmed)),
             "needs_check_count": len(needs_check),
             "no_confirmed_message": top4.get("no_confirmed_message") or "",
@@ -1108,7 +1284,8 @@ class Consultant:
 
         if not answer:
             # Без ИИ показываем обычные результаты и понятное сообщение.
-            fallback = self.catalog.search(message, 6)
+            fallback = self.catalog.search(message, 6,
+                                           reqs=session.requirements or None)
             for card in fallback["cards"]:
                 if all(c["id"] != card["id"] for c in cards):
                     cards.append(card)
@@ -1176,6 +1353,8 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
                 f"({item['role']}).")
             if item.get("facts"):
                 lines.append(f"   Основание: {'; '.join(item['facts'])}.")
+            if item.get("limitation"):
+                lines.append(f"   Ограничение: {item['limitation']}.")
             if item.get("problems"):
                 lines.append(f"   Не подтверждено: {'; '.join(item['problems'])}.")
     elif not no_confirmed:
@@ -1188,6 +1367,8 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
             lines.append(
                 f"{index}. {item['name']} — {item['type_label']}, "
                 f"{item['price_text']}, {item['available_text']}.")
+            if item.get("limitation"):
+                lines.append(f"   Ограничение: {item['limitation']}.")
             if item.get("problems"):
                 lines.append(f"   Причина: {'; '.join(item['problems'])}.")
 

@@ -308,10 +308,25 @@ def _group_key(offer: dict) -> str:
     return offer["group_id"] or f"offer:{offer['id']}"
 
 
+def _sku_allowed(offer: dict, reqs: dict | None) -> bool:
+    """Артикул не противоречит обязательным условиям запроса.
+
+    Проверка идёт ДО выбора представителя группы: если в семействе есть
+    и «для рабочей станции Windows», и «для физического сервера», серверный
+    вариант оценивается отдельно, а не подменяется первым по релевантности.
+    """
+    if not reqs:
+        return True
+    # Локальный импорт: selection импортирует этот модуль.
+    from selection import sku_conflict
+    return not sku_conflict(offer, reqs)
+
+
 def _score_group_offers(conn: sqlite3.Connection, group_key: str,
                         query: str, q_norm: str, q_tokens: list[str],
                         q_versions: set[str],
-                        cache: dict | None = None) -> list[tuple[dict, float, dict]]:
+                        cache: dict | None = None,
+                        reqs: dict | None = None) -> list[tuple[dict, float, dict]]:
     if group_key.startswith("offer:"):
         offer = get_offer(conn, group_key.split(":", 1)[1])
         offers = [offer] if offer else []
@@ -322,6 +337,8 @@ def _score_group_offers(conn: sqlite3.Connection, group_key: str,
             "description, kind, offer_type, license_type_raw, platform, "
             "duration FROM offers WHERE group_id=?", (group_key,))
         offers = [_row_to_offer(r) for r in rows]
+    if reqs:
+        offers = [o for o in offers if _sku_allowed(o, reqs)]
     scored = []
     for offer in offers:
         hit = cache.get(offer["id"]) if cache is not None else None
@@ -479,9 +496,10 @@ def strip_conversational_prefix(query: str) -> str:
 def _build_group(conn: sqlite3.Connection, key: str, query: str, q_norm: str,
                  q_tokens: list[str], q_versions: set[str], intent: dict,
                  product_tokens: list[str],
-                 variants_limit: int, cache: dict | None = None) -> dict | None:
+                 variants_limit: int, cache: dict | None = None,
+                 reqs: dict | None = None) -> dict | None:
     scored = _score_group_offers(conn, key, query, q_norm, q_tokens, q_versions,
-                                 cache)
+                                 cache, reqs)
     if not scored:
         return None
     best_offer, best_score, best_details, combined = _pick_representative(
@@ -528,7 +546,8 @@ def _fill_from_category(conn: sqlite3.Connection, anchor: dict, query: str,
                         seen_family: set[tuple[str, str]],
                         need: int, scope: str = "category",
                         cache: dict | None = None,
-                        kind_filter: str | None = None) -> list[dict]:
+                        kind_filter: str | None = None,
+                        reqs: dict | None = None) -> list[dict]:
     """Добирает альтернативы из той же категории каталога.
 
     Нужно, когда прямое совпадение одно (например, «anydesk» — одна
@@ -565,7 +584,7 @@ def _fill_from_category(conn: sqlite3.Connection, anchor: dict, query: str,
     out: list[dict] = []
     for key in keys:
         g = _build_group(conn, key, query, q_norm, q_tokens, q_versions,
-                         intent, product_tokens, variants_limit, cache)
+                         intent, product_tokens, variants_limit, cache, reqs)
         if not g:
             continue
         if kind_filter and g["kind"] != kind_filter:
@@ -775,7 +794,7 @@ def _split_for_os(groups: list[dict]) -> dict | None:
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int = 10,
-           variants_limit: int = 8) -> dict:
+           variants_limit: int = 8, reqs: dict | None = None) -> dict:
     # Один путь для текстового и голосового ввода: «Найди Linux» → «Linux».
     effective_query = strip_conversational_prefix(query)
     # Раскладку правим до нечёткого поиска: «cthdth» → «сервер», а уже потом
@@ -794,8 +813,18 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
                 "layout_fixes": layout_fixes, "corrections": [],
                 "intent": intent, "candidates": 0, "total": 0, "shortfall": True}
 
+    # reqs нужен для отбраковки SKU до выбора представителя группы.
+    if reqs is None:
+        from selection import extract_requirements
+        reqs = extract_requirements(q_norm or effective_query)
+
     ids = _candidate_ids(conn, q_tokens)
     offers = _load_offers(conn, ids)
+    # Отбраковка несовместимых артикулов до ранжирования групп: иначе
+    # «для рабочей станции Windows» задаёт вес всему семейству, а нужный
+    # «для физического сервера» вариант до представителя не доходит.
+    if reqs:
+        offers = [o for o in offers if _sku_allowed(o, reqs)]
 
     # «ПО для сервера»: оставляем только программы, иначе частотное
     # «сервер» вытесняет софт железом.
@@ -832,7 +861,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
     for key in top_keys:
         g = _build_group(conn, key, effective_query, q_norm, q_tokens,
                          q_versions, intent, product_tokens, variants_limit,
-                         score_cache)
+                         score_cache, reqs)
         if not g:
             continue
         # Группа может содержать предложения разных классов: при запросе
@@ -871,7 +900,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
                 conn, anchor, query, q_norm, q_tokens, q_versions, intent,
                 product_tokens, variants_limit, skip_keys, seen_family,
                 4 - len(groups), scope="category", cache=score_cache,
-                kind_filter="server_software" if software_only else None)
+                kind_filter="server_software" if software_only else None,
+                reqs=reqs)
             groups.extend(extra)
             # 2. родительская категория
             if len(groups) < 4:
@@ -880,7 +910,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
                     conn, anchor, query, q_norm, q_tokens, q_versions, intent,
                     product_tokens, variants_limit, skip_keys, seen_family,
                     4 - len(groups), scope="path", cache=score_cache,
-                    kind_filter="server_software" if software_only else None)
+                    kind_filter="server_software" if software_only else None,
+                    reqs=reqs)
                 groups.extend(extra2)
 
     # Товары «для этой ОС» — отдельной секцией, сама ОС остаётся в прямых.
@@ -913,6 +944,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
         "candidates": len(offers),
         "total": total,
         "shortfall": total < 4,
+        "requirements": reqs,
         "groups": groups[: max(limit, 4)],
         "buckets": {k: v[: max(limit, 4)] for k, v in buckets.items() if v},
         "bucket_titles": bucket_titles,
