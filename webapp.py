@@ -141,6 +141,7 @@ def api_search(q: str = "", limit: int = 12):
         "intent": result["intent"]["name"],
         "tokens": result["tokens"],
         "corrections": result.get("corrections") or [],
+        "layout_fixes": result.get("layout_fixes") or [],
         "total": result["total"],
         "shortfall": result["shortfall"],
         "software_only": result.get("software_only", False),

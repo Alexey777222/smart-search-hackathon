@@ -36,6 +36,7 @@ import config_v3
 from organizer_index import (DEFAULT_DB, OFFER_TYPE_LABELS, _family_name,
                              canon_token, connect, get_offer, normalize_text,
                              query_tokens, tokenize, tokenize_cached)
+from query_normalize import fix_keyboard_layout, term_known
 
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
 _SERVER_KINDS = ("server_hardware", "server_component", "server_software")
@@ -353,12 +354,52 @@ def _pick_representative(scored: list[tuple[dict, float, dict]],
     return best
 
 
-def _family_key(offer: dict) -> tuple[str, str]:
+# Слова-квалификаторы не меняют продуктовое семейство: редакция, тип
+# поставки, платформа. «Кибер Бэкап Стандартная редакция», «… Расширенная
+# редакция» и «… Облачный» — одно семейство одного вендора, поэтому в
+# топ-4 попадает максимум одна позиция семейства.
+_FAMILY_QUALIFIERS = {
+    "стандартн", "расширенн", "базов", "профессиональн", "корпоративн",
+    "облачн", "старт", "редакц", "верси", "лиценз", "подписк", "пакет",
+    "сертифицированн", "образовательн", "организац", "рабоч", "станци",
+    "пользовател", "устройств", "год", "мес", "месяц", "помесячн", "шт",
+    "электронн", "коробочн", "дополнительн", "техподдержк", "сопровожден",
+    "продлен", "включа", "услуг", "техническ", "поддержк",
+    "windows", "виндовс", "linux", "астра", "astra", "astralinux", "unix",
+    "macos", "x64", "x86", "x86-64", "aarch64", "arm", "e2k", "для", "на",
+}
+
+# Название до первой скобки или запятой — это ядро продукта; всё дальше
+# описывает поставку («лицензия для образовательных организаций»,
+# «для рабочей станции Windows») и семейство не меняет.
+_FAMILY_CORE_RE = re.compile(r"^[^(,]+")
+
+
+def product_family(offer: dict) -> tuple[str, str]:
+    """Ключ продуктового семейства по данным каталога.
+
+    Берётся вендор и значимые токены ядра названия без редакции, типа
+    поставки и платформы. Это общее правило: редакции одного продукта
+    больше не считаются разными семействами, а разные продукты того же
+    вендора — по-прежнему разные.
+    """
+    vendor = normalize_text(offer.get("vendor") or "")
+    name = normalize_text(offer.get("name") or "")
+    core = (_FAMILY_CORE_RE.match(name).group(0) if _FAMILY_CORE_RE.match(name)
+            else name)
+    tokens = sorted(
+        t for t in tokenize(core)
+        if t not in _FAMILY_QUALIFIERS and len(t) >= 2
+    )
+    return (vendor, " ".join(tokens) or core)
+
+
+def _family_key(offer: dict) -> tuple[str, str, str]:
     """Ключ дедупликации линеек: вендор + имя семейства + группа типа."""
-    family = normalize_text(display_name(offer.get("name") or ""))
+    vendor, family = product_family(offer)
     otype = offer.get("offer_type") or "unknown"
     group = "support" if otype == "support" else "license"
-    return (normalize_text(offer.get("vendor") or ""), family, group)
+    return (vendor, family, group)
 
 
 _INTENT_TOKENS = {
@@ -642,6 +683,22 @@ def _fix_token(token: str, vocab: dict) -> tuple[str, int] | None:
     return best[2], best[0]
 
 
+def fix_layout(conn: sqlite3.Connection, text: str) -> tuple[str, list[dict]]:
+    """Общая нормализация раскладки: до нечёткого поиска и до вызова модели.
+
+    Слово заменяется, только если его нет в словаре каталога и словаре
+    поисковых терминов, а вариант в другой раскладке там есть. Токены с
+    цифрами (артикулы, версии, архитектуры) не трогаются.
+    """
+    freq = _vocab(conn)["freq"]
+
+    def known(word: str) -> bool:
+        w = word.lower().replace("ё", "е")
+        return w in freq or canon_token(w) in freq or term_known(w)
+
+    return fix_keyboard_layout(text, known)
+
+
 def _correct_tokens(conn: sqlite3.Connection, q_tokens: list[str],
                     q_norm: str) -> tuple[list[str], str, list[dict]]:
     """Исправляет однозначные опечатки до ранжирования."""
@@ -721,6 +778,9 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
            variants_limit: int = 8) -> dict:
     # Один путь для текстового и голосового ввода: «Найди Linux» → «Linux».
     effective_query = strip_conversational_prefix(query)
+    # Раскладку правим до нечёткого поиска: «cthdth» → «сервер», а уже потом
+    # словарь каталога исправляет опечатки вроде «linuc» → «linux».
+    effective_query, layout_fixes = fix_layout(conn, effective_query)
     q_norm = normalize_text(effective_query)
     q_tokens = query_tokens(effective_query)
     q_tokens, q_norm, corrections = _correct_tokens(conn, q_tokens, q_norm)
@@ -731,6 +791,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
     if not q_tokens:
         return {"query": query, "effective_query": effective_query,
                 "groups": [], "sections": None, "buckets": None,
+                "layout_fixes": layout_fixes, "corrections": [],
                 "intent": intent, "candidates": 0, "total": 0, "shortfall": True}
 
     ids = _candidate_ids(conn, q_tokens)
@@ -745,7 +806,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
             return {"query": query, "effective_query": effective_query,
                     "groups": [], "sections": None,
                     "buckets": None, "intent": intent, "candidates": 0,
-                    "total": 0, "shortfall": True, "software_only": True}
+                    "total": 0, "shortfall": True, "software_only": True,
+                    "layout_fixes": layout_fixes, "corrections": corrections}
 
     # Первичный отбор: лучший вариант каждой группы по релевантности текста.
     # Тип предложения здесь только разрешает ничьи: иначе бонус за базовую
@@ -844,6 +906,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
         "normalized": q_norm,
         "tokens": q_tokens,
         "corrections": corrections,
+        "layout_fixes": layout_fixes,
         "versions": sorted(q_versions),
         "intent": intent,
         "software_only": software_only,

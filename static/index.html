@@ -126,6 +126,7 @@ const TYPE_CLASS = (card) => {
 function cardHtml(card) {
   const badges = [`<span class="badge ${TYPE_CLASS(card)}">${esc(card.type_label)}</span>`];
   if (!card.available) badges.push('<span class="badge off">нет в наличии</span>');
+  if (card.needs_check) badges.push('<span class="badge off">Совместимость требует проверки</span>');
   if (card.platform) badges.push(`<span class="badge">${esc(card.platform)}</span>`);
   if (card.duration && card.duration !== "Не определено")
     badges.push(`<span class="badge">${esc(card.duration)}</span>`);
@@ -199,6 +200,12 @@ function renderSearch(data) {
   }
   if (data.software_only) {
     html += `<div class="notice">Запрос понят как «ПО для сервера»: показаны программы, а не железо.</div>`;
+  }
+  if (data.layout_fixes && data.layout_fixes.length) {
+    const fixes = data.layout_fixes
+      .map(c => `${esc(c.from)} → ${esc(c.to)}`).join(", ");
+    html += `<div class="notice">Исправлена раскладка: ${fixes}.
+      Поиск выполнен по исправленному запросу, в поле остался исходный ввод.</div>`;
   }
   if (data.corrections && data.corrections.length) {
     const fixes = data.corrections
@@ -287,14 +294,21 @@ async function sendChat() {
     if (!res.ok) { addMsg("bot", data.detail || "Ошибка консультанта"); return; }
     addMsg("bot", data.answer);
     renderChatCards(data.cards);
-    const modelLabel = data.model || data.provider;
+    // Подпись — только по фактическим данным ответа API.
     const mode = data.used_model
-      ? `живой ${data.provider} (${modelLabel})`
-      : `без модели — локальная подборка (${data.provider})`;
-    $("chatStats").textContent =
-      `режим: ${mode} · вызовов модели: ${data.calls} · ${data.latency_ms} мс · ` +
-      `токены: ${data.usage.prompt}/${data.usage.completion} · ` +
-      `расчётно: ${data.cost_rub} ₽`;
+      ? `провайдер: ${data.provider} · модель: ${data.model || "не указана"}`
+      : "Ответ без модели";
+    const parts = [`режим: ${mode}`, `вызовов модели: ${data.calls}`,
+                   `${data.latency_ms} мс`];
+    const api = data.api_usage || {};
+    if (data.used_model && api.total_tokens) {
+      parts.push(`токены API: вход ${api.input_tokens}, выход ${api.output_tokens}, ` +
+                 `всего ${api.total_tokens}`);
+    }
+    if (data.cost && data.cost.amount_rub != null) {
+      parts.push(`расчётная стоимость: ${data.cost.amount_rub} ₽`);
+    }
+    $("chatStats").textContent = parts.join(" · ");
   } finally {
     btn.disabled = false;
   }

@@ -4,6 +4,17 @@
   1. «Нужен сервер».
   2. «Сервер уже есть, на нём Astra Linux 1.7, нужно резервное копирование».
 
+Дополнительно — регрессия дефекта «брендовое сужение + Windows-only SKU»:
+сохранение версии 1.7, исключение SKU только для Windows, отсутствие
+дублей семейства, точная формулировка при отсутствии подтверждённых
+совпадений, резервный ответ без модели и одинаковые правила подбора для
+голосового и текстового ввода.
+
+Ещё одна регрессия — автоисправление раскладки клавиатуры (ЙЦУКЕН ↔ QWERTY):
+«cthdth» → «сервер», «cthdth Dell» → «сервер Dell», сохранение названий,
+артикулов, версий и архитектур, «astra linuc» → «astra linux» и неизменность
+нераспознанных слов. Проверяется и обычный поиск, и консультант.
+
 Запуск без ключа (заглушка, локальная подборка):
   python check_gigachat.py
 
@@ -22,11 +33,15 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import organizer_search as osr
 from ai_consultant import (Catalog, Consultant, GigaChatProvider,
                            MockProvider, ProviderError)
-from selection import build_top4, extract_requirements
+from selection import (NEEDS_CHECK_NOTE, build_top4, extract_requirements,
+                       family_id, platform_conflict)
+from query_normalize import layout_note
+
 
 
 class _FakePart:
@@ -122,6 +137,194 @@ def _print_cards(cards: list[dict]) -> None:
             print(f"       не подтверждено: {'; '.join(card['problems'])}")
 
 
+def _windows_only(platform: str) -> bool:
+    """Поле платформы явно описывает только Windows (без Linux-семейств)."""
+    text = (platform or "").lower()
+    has_windows = "windows" in text or "виндовс" in text
+    has_linux = any(alias in text for alias in
+                    ("linux", "астра", "astralinux", "unix", "redos",
+                     "альт", "рос"))
+    return has_windows and not has_linux
+
+
+def _scenario_checks(second: dict, catalog: Catalog, message: str) -> list[dict]:
+    """Регрессия дефекта: бренд-сужение, Windows-only SKU, дубли семейств.
+
+    Проверяется фактический ответ консультанта: намерение «резервное
+    копирование» сохранено, версия ОС 1.7 не потеряна, явные Windows-only
+    SKU исключены, редакции одного продукта не дублируются, а при
+    отсутствии подтверждённой совместимости звучит точная формулировка.
+    """
+    checks: list[dict] = []
+    cards = second.get("cards") or []
+    ids = [card.get("id") for card in cards]
+    reqs = extract_requirements(message)
+    label = "Astra Linux 1.7"
+    expected = ("В каталоге не найдено предложений с подтверждённой "
+                f"совместимостью с {label}")
+    answer = second.get("answer") or ""
+
+    # Намерение и версия ОС.
+    checks.append(_pass("намерение «резервное копирование» сохранено",
+                        "резерв" in second["query"].lower()
+                        or "бэкап" in second["query"].lower()))
+    checks.append(_pass("версия 1.7 сохранена в условиях",
+                        "1.7" in [str(v) for v in
+                                  (second["requirements"].get("version") or [])]))
+    checks.append(_pass("поиск не сужен до одного бренда",
+                        "кибер" not in second["query"].lower()))
+
+    # Windows-only SKU не показываются при обязательной Astra Linux.
+    win_only = [card for card in cards
+                if _windows_only(card.get("platform"))]
+    checks.append(_pass("Windows-only SKU исключены из выдачи",
+                        not win_only))
+    row = catalog.conn.execute(
+        "SELECT name, platform FROM offers WHERE id = ?",
+        ("499533",)).fetchone()
+    if row:
+        checks.append(_pass("SKU 499533 (Windows-only) не показан",
+                            "499533" not in ids))
+    checks.append(_pass("Windows-only SKU даёт конфликт, а не «неизвестно»",
+                        bool(platform_conflict(
+                            {"name": row[0] if row else "Кибер Бэкап",
+                             "platform": "Windows"},
+                            reqs))))
+
+    # Семейства: одна позиция на продуктовое семейство.
+    families = [card.get("family_id") or family_id(card) for card in cards]
+    checks.append(_pass("нет дублей семейства в выдаче",
+                        len(set(families)) == len(families)))
+    vendors = {(card.get("vendor") or "").lower() for card in cards}
+    checks.append(_pass("выдача охватывает разных производителей",
+                        len(vendors) >= 3))
+
+    # Формулировка при отсутствии подтверждённых совпадений.
+    checks.append(_pass("verified_count = 0", second["verified_count"] == 0))
+    checks.append(_pass("неподтверждённые не в счётчике подтверждённых",
+                        len(cards) == second["needs_check_count"]
+                        and all(card.get("needs_check") for card in cards)))
+    checks.append(_pass("точная формулировка no_confirmed",
+                        second["no_confirmed_message"] == expected))
+    checks.append(_pass("формулировка есть в тексте ответа", expected in answer))
+    checks.append(_pass("нет ложного «Подтверждённых результатов»",
+                        "Подтверждённых результатов" not in answer))
+    checks.append(_pass("аналоги помечены «Совместимость требует проверки»",
+                        NEEDS_CHECK_NOTE in answer
+                        and all(card.get("verification_note") == NEEDS_CHECK_NOTE
+                                for card in cards)))
+    checks.append(_pass("выдача не добита до четырёх неподходящими",
+                        len(cards) <= 4
+                        and second["top4"].get("count") == 0))
+    return checks
+
+
+def _input_parity_checks() -> list[dict]:
+    """Голос и текст идут через один эндпоинт и одни правила подбора."""
+    root = Path(__file__).resolve().parent
+    web = (root / "webapp.py").read_text(encoding="utf-8")
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    return [
+        _pass("один эндпоинт консультанта для текста и голоса",
+              web.count('"/api/consult"') == 1),
+        _pass("голосовой ввод отправляет через sendChat()",
+              "rec.onresult" in html and "sendChat();" in html),
+        _pass("страница вызывает /api/consult один раз (общий путь)",
+              html.count('fetch("/api/consult"') == 1),
+    ]
+
+
+def _layout_checks(catalog: Catalog, consultant: Consultant,
+                   live: bool) -> list[dict]:
+    """Регрессия автоисправления раскладки: поиск и консультант."""
+    conn = catalog.conn
+    checks: list[dict] = []
+
+    def groups_of(result: dict) -> list[str]:
+        return [g["best"]["id"] for g in result["groups"]]
+
+    def top4_of(result: dict) -> list[str]:
+        top4 = build_top4(result, extract_requirements(
+            result.get("normalized") or result.get("effective_query") or ""))
+        return [item["id"] for item in top4["items"]]
+
+    print("\n[6] Автоисправление раскладки ЙЦУКЕН ↔ QWERTY")
+
+    # 1. «cthdth» даёт ту же выдачу, что «сервер».
+    fixed, notes = osr.fix_layout(conn, "cthdth")
+    print(f"  «cthdth» → «{fixed}» · {layout_note(notes)}")
+    checks.append(_pass("раскладка: cthdth → сервер", fixed == "сервер"))
+    checks.append(_pass("подпись: «Исправлена раскладка: cthdth → сервер»",
+                        layout_note(notes)
+                        == "Исправлена раскладка: cthdth → сервер"))
+    typo = osr.search(conn, "cthdth", limit=12)
+    server = osr.search(conn, "сервер", limit=12)
+    print(f"  карточек: {len(typo['groups'])} · "
+          f"первая: {typo['groups'][0]['name'] if typo['groups'] else '—'}")
+    checks.append(_pass("cthdth: выдача совпадает с «сервер»",
+                        groups_of(typo) == groups_of(server)
+                        and top4_of(typo) == top4_of(server)))
+    checks.append(_pass("cthdth: исходный ввод сохранён в ответе",
+                        typo["query"] == "cthdth"
+                        and typo["effective_query"] == "сервер"))
+    checks.append(_pass("cthdth: исправление помечено в ответе",
+                        bool(typo.get("layout_fixes"))))
+
+    # 2. Смешанный запрос: «cthdth Dell» = «сервер Dell».
+    mixed = osr.search(conn, "cthdth Dell", limit=12)
+    mixed_ref = osr.search(conn, "сервер Dell", limit=12)
+    print(f"  «cthdth Dell» → «{mixed['effective_query']}»")
+    checks.append(_pass("cthdth Dell → «сервер Dell»",
+                        mixed["effective_query"] == "сервер Dell"))
+    checks.append(_pass("cthdth Dell: выдача как у «сервер Dell»",
+                        groups_of(mixed) == groups_of(mixed_ref)
+                        and top4_of(mixed) == top4_of(mixed_ref)))
+
+    # 3. Распознанные названия, артикулы, версии и архитектуры сохраняются.
+    for phrase in ("Astra Linux 1.7", "x86-64", "epcscnl-530606",
+                   "КриптоПро CSP"):
+        kept, keep_notes = osr.fix_layout(conn, phrase)
+        checks.append(_pass(f"сохранено без правок: {phrase}",
+                            kept == phrase and not keep_notes))
+
+    # 4. Опечатка «astra linuc» исправляется как раньше.
+    linuc = osr.search(conn, "astra linuc", limit=12)
+    checks.append(_pass("astra linuc: раскладка не тронута",
+                        not linuc.get("layout_fixes")))
+    checks.append(_pass("astra linuc → astra linux",
+                        any(c["to"] == "linux" for c in linuc["corrections"])))
+
+    # 5. Нераспознанное слово без подтверждённого варианта остаётся как введено.
+    for junk in ("qwfpgjl", "asdfgh", "zzzz"):
+        kept, keep_notes = osr.fix_layout(conn, junk)
+        checks.append(_pass(f"нераспознанное осталось: {junk}",
+                            kept == junk and not keep_notes))
+
+    # Консультант: та же нормализация до передачи запроса модели.
+    session = consultant.new_session()
+    fixed_answer = consultant.ask(session.id, "cthdth")
+    print(f"  консультант: запрос «{fixed_answer['query']}» · "
+          f"{layout_note(fixed_answer.get('layout_fixes') or [])}")
+    checks.append(_pass("консультант: раскладка исправлена до вызова модели",
+                        bool(fixed_answer.get("layout_fixes"))
+                        and "сервер" in fixed_answer["query"].lower()))
+    checks.append(_pass("консультант: подпись об исправленной раскладке",
+                        "Исправлена раскладка: cthdth → сервер"
+                        in fixed_answer["answer"]))
+    checks.append(_pass("консультант: исходный ввод сохранён",
+                        fixed_answer.get("original_message") == "cthdth"))
+    if not live:
+        plain_answer = consultant.ask(consultant.new_session().id, "сервер")
+        checks.append(_pass("консультант: выдача как у «сервер»",
+                            [c["id"] for c in fixed_answer["cards"]]
+                            == [c["id"] for c in plain_answer["cards"]]))
+        mixed_answer = consultant.ask(consultant.new_session().id, "cthdth Dell")
+        print(f"  консультант: «cthdth Dell» → запрос «{mixed_answer['query']}»")
+        checks.append(_pass("консультант: «cthdth Dell» → «сервер Dell»",
+                            mixed_answer["query"].lower() == "сервер dell"))
+    return checks
+
+
 def run(live: bool) -> int:
     catalog = Catalog()
     consultant = Consultant(catalog)
@@ -201,13 +404,45 @@ def run(live: bool) -> int:
     if live:
         checks.append(_pass("реплика 2: живой ответ модели (не резерв)",
                             second["used_model"]))
+        model_ok = (second["model"]
+                    == getattr(consultant.provider, "model", ""))
+        checks.append(_pass("подпись: фактическая модель из ответа API",
+                            model_ok))
+        checks.append(_pass("стоимость только как расчётная или не показана",
+                            second["cost"] is None
+                            or second["cost"].get("estimated") is True))
     else:
         checks.append(_pass("реплика 2 помечена ответ без модели",
                             not second["used_model"]
                             and "без модели" in second["answer"].lower()))
+    # Подпись под ответом: «Ответ без модели» для резерва, иначе
+    # фактический провайдер и модель из данных ответа.
+    signature = ("Ответ без модели" if not second["used_model"]
+                 else f"провайдер: {second['provider']} · "
+                      f"модель: {second['model'] or 'не указана'}")
+    print(f"  подпись: {signature}")
+    checks.append(_pass("подпись соответствует режиму ответа",
+                        signature == "Ответ без модели"
+                        if not second["used_model"]
+                        else "модель:" in signature))
+    if not second["used_model"]:
+        checks.append(_pass("резерв: нет токенов API и стоимости",
+                            not second["api_usage"]
+                            and second["cost"] is None))
+    else:
+        checks.append(_pass("живой ответ: токены API фактически получены",
+                            bool(second["api_usage"].get("total_tokens"))))
+
+    # ── регрессия дефекта: Astra Linux 1.7 + резервное копирование ─
+    print("\n[3] Регрессия: бренд-сужение, Windows-only, дубли семейств")
+    scenario = _scenario_checks(second, catalog, message2)
+    checks.extend(scenario)
+    for check in scenario:
+        status = "[PASS]" if check["ok"] else "[FAIL]"
+        print(f"  {status} {check['label']}")
 
     # ── обычный поиск ────────────────────────────────────────────
-    print("\n[3] Обычный локальный поиск «astra linuc»")
+    print("\n[4] Обычный локальный поиск «astra linuc»")
     result = osr.search(catalog.conn, "astra linuc", limit=12)
     top4 = build_top4(result, extract_requirements(
         result.get("normalized") or result.get("effective_query") or "astra linuc"))
@@ -223,8 +458,23 @@ def run(live: bool) -> int:
     checks.append(_pass("astra linuc: первый результат — Astra",
                         "astra" in first_name.lower()))
 
+    # ── голос и текст: одинаковые правила подбора ────────────────
+    print("\n[5] Голосовой и текстовый ввод — общий путь")
+    parity = _input_parity_checks()
+    checks.extend(parity)
+    for check in parity:
+        status = "[PASS]" if check["ok"] else "[FAIL]"
+        print(f"  {status} {check['label']}")
+
+    # ── автоисправление раскладки клавиатуры ─────────────────────
+    layout_checks = _layout_checks(catalog, consultant, live)
+    checks.extend(layout_checks)
+    for check in layout_checks:
+        status = "[PASS]" if check["ok"] else "[FAIL]"
+        print(f"  {status} {check['label']}")
+
     # ── адаптер на заглушке SDK ──────────────────────────────────
-    print("\n[4] Адаптер GigaChat с заглушкой SDK")
+    print("\n[7] Адаптер GigaChat с заглушкой SDK")
     adapter_checks = _adapter_stub_checks()
     checks.extend(adapter_checks)
     for check in adapter_checks:

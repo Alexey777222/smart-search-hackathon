@@ -39,11 +39,22 @@ ROLE_ANALOG = "функциональный аналог"
 # документацию вендора опирается вывод. Правило не подменяет факты
 # фида: если подтверждения нет, характеристика считается неизвестной.
 
+# Платформенное семейство ОС: нужно, чтобы отличить жёсткий конфликт
+# («SKU только для Windows» при обязательной Astra Linux) от неизвестной
+# характеристики (пустая или смешанная платформа).
+_PLATFORM_FAMILIES = {
+    "linux": ("linux", "астра", "astralinux", "redos", "ред ос", "альт",
+              "centos", "debian", "ubuntu", "rhel", "suse", "рос", "unix",
+              "аврора"),
+    "windows": ("windows", "виндовс"),
+}
+
 COMPAT_RULES = (
     {
         "id": "astra-linux-se",
         "kind": "os",
         "product": "Astra Linux Special Edition",
+        "platform_family": "linux",
         # aliases — для распознавания ОС в запросе (можно короткие формы).
         "aliases": ("astra linux", "астра линукс", "астра", "astralinux"),
         # evidence — для подтверждения в данных SKU: только однозначные
@@ -222,14 +233,42 @@ def is_os_offer(offer: dict) -> bool:
     return bool(re.search(r"операционная систем", name))
 
 
+def platform_conflict(offer: dict, reqs: dict) -> str:
+    """Явный конфликт платформы конкретного SKU с обязательной ОС.
+
+    Возвращает причину конфликта или пустую строку. Пустая или смешанная
+    платформа («Linux/Windows») конфликтом не считается — это неизвестная
+    характеристика, а не подтверждённая совместимость.
+    """
+    rule = _RULES_BY_ID.get((reqs or {}).get("os_rule") or "")
+    if not rule or rule.get("kind") != "os":
+        return ""
+    want = rule.get("platform_family")
+    if not want:
+        return ""
+    platform = normalize_text(offer.get("platform") or "")
+    if not platform:
+        return ""
+    present = {name for name, aliases in _PLATFORM_FAMILIES.items()
+               if any(alias in platform for alias in aliases)}
+    # «Windows» без Linux — единственная платформа SKU.
+    if present == {"windows"} and want == "linux":
+        return (f"платформа SKU — только Windows, а требуется "
+                f"«{rule['product']}»")
+    return ""
+
+
 # ── проверка обязательных характеристик SKU ───────────────────────
 
 def verify_requirements(offer: dict, reqs: dict) -> dict:
     """Проверяет обязательные характеристики конкретного SKU.
 
     Возвращает {"verified": bool, "facts": [...], "problems": [...],
-    "rule": rule|None}. Пустые обязательные условия — проверять нечего,
-    такой товар годится как аналог (не как «проверенная допродажа»).
+    "conflict": bool, "rule": rule|None}. `conflict` — явное противоречие
+    (например, SKU только для Windows при обязательной Astra Linux):
+    такой товар нельзя показывать даже как аналог. Пустые обязательные
+    условия — проверять нечего, такой товар годится как аналог
+    (не как «проверенная допродажа»).
     """
     facts: list[str] = []
     problems: list[str] = []
@@ -246,17 +285,24 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
                 problems.append("платформа только Windows, а Windows исключён "
                                 "запросом")
                 return {"verified": False, "facts": facts,
-                        "problems": problems, "rule": rule}
+                        "problems": problems, "conflict": True, "rule": rule}
+
+    # 0б. Явный платформенный конфликт проверяется ниже, после поиска
+    # подтверждения ОС: название SKU («… для Astra Linux») сильнее общего
+    # поля платформы.
 
     # 1. ОС из запроса.
     if rule:
         alias = _alias_hit(offer, rule.get("evidence") or rule["aliases"])
-        if alias:
-            facts.append(f"ОС «{rule['product']}» указана в данных SKU")
-        else:
-            problems.append(f"совместимость с «{rule['product']}» не подтверждена")
+        if not alias:
+            # Подтверждения в данных SKU нет. Если платформа явно только
+            # Windows, а нужна Linux-ОС — это конфликт, а не «неизвестно».
+            conflict = platform_conflict(offer, reqs or {})
+            problems.append(conflict or
+                            f"совместимость с «{rule['product']}» не подтверждена")
             return {"verified": False, "facts": facts, "problems": problems,
-                    "rule": rule}
+                    "conflict": bool(conflict), "rule": rule}
+        facts.append(f"ОС «{rule['product']}» указана в данных SKU")
 
         # 2. Версия ОС (если запрошена явно).
         if reqs.get("version"):
@@ -280,7 +326,7 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
                 problems.append(
                     f"версия {', '.join(reqs['version'])} не подтверждена")
                 return {"verified": False, "facts": facts,
-                        "problems": problems, "rule": rule}
+                        "problems": problems, "conflict": False, "rule": rule}
 
     # 2б. Версия вне правила ОС: «photoshop 2025» без 2025 в SKU —
     # не точное совпадение.
@@ -293,7 +339,7 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
             problems.append(
                 f"версия {', '.join(reqs['version'])} не подтверждена")
             return {"verified": False, "facts": facts, "problems": problems,
-                    "rule": rule}
+                    "conflict": False, "rule": rule}
 
     # 3. Архитектура.
     if reqs and reqs.get("arch"):
@@ -306,7 +352,7 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
         else:
             problems.append(f"архитектура {arch} не подтверждена")
             return {"verified": False, "facts": facts, "problems": problems,
-                    "rule": rule}
+                    "conflict": False, "rule": rule}
 
     # 4. Тип лицензии.
     if reqs and reqs.get("license_type"):
@@ -321,15 +367,16 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
                 f"тип лицензии «{OFFER_TYPE_LABELS.get(have, have)}» "
                 f"не соответствует запросу «{OFFER_TYPE_LABELS.get(want, want)}»")
             return {"verified": False, "facts": facts, "problems": problems,
-                    "rule": rule}
+                    "conflict": False, "rule": rule}
 
     # 5. Намерение «купить ОС»: кандидат должен быть ОС.
     if reqs and reqs.get("wants_os") and not rule and not is_os_offer(offer):
         problems.append("запрос про операционную систему, а SKU — не ОС")
         return {"verified": False, "facts": facts, "problems": problems,
-                "rule": rule}
+                "conflict": False, "rule": rule}
 
-    return {"verified": True, "facts": facts, "problems": problems, "rule": rule}
+    return {"verified": True, "facts": facts, "problems": problems,
+            "conflict": False, "rule": rule}
 
 
 def _requirement_summary(reqs: dict) -> str:
@@ -349,21 +396,20 @@ def _requirement_summary(reqs: dict) -> str:
 # ── семейства и предпочтение доступных SKU с ценой ────────────────
 
 def family_id(offer: dict) -> str:
-    """Ключ семейства: group_id, иначе вендор + имя семейства.
+    """Ключ семейства по данным каталога: вендор + имя без редакции.
 
-    У серверов group_id в фиде нет, а название содержит конфигурацию:
+    Редакции одного продукта (group_id в фиде у них разные) — одно
+    семейство, поэтому в топ-4 попадает максимум одна позиция семейства.
+    У серверов group_id нет, а название содержит конфигурацию:
     «Сервер INFERIT RS108 R1G2D24/…». Конфигурации одной модели — это
     одно семейство, поэтому для оборудования берём вендора и модель.
     """
-    gid = offer.get("group_id")
-    if gid:
-        return f"g:{gid}"
     name = normalize_text(offer.get("name") or "")
     vendor = normalize_text(offer.get("vendor") or "")
-    if _SERVER_NAME_RE.match(name):
+    if not offer.get("group_id") and _SERVER_NAME_RE.match(name):
         tokens = [t for t in re.split(r"[\s/,]+", name) if t][:3]
         return "h:" + vendor + "|" + " ".join(tokens)
-    return "f:" + "|".join(osr._family_key(offer))
+    return "f:" + "|".join(osr.product_family(offer))
 
 
 def _pref_tier(group: dict) -> int:
@@ -484,8 +530,34 @@ def _verified_candidates(groups: list[dict], reqs: dict) -> list[dict]:
     return out
 
 
+def _short_os(product: str) -> str:
+    """Короткое имя ОС для формулировок: «… Special Edition» → «…»."""
+    return re.sub(r"\s+(?:special\s+edition|se)$", "", product or "",
+                  flags=re.I).strip()
+
+
+def compat_requirement_label(reqs: dict) -> str:
+    """«Astra Linux 1.7» из обязательных условий (ОС + версия)."""
+    if not reqs or not reqs.get("os"):
+        return ""
+    label = _short_os(reqs["os"])
+    versions = [str(v) for v in (reqs.get("version") or [])]
+    return (label + (" " + " ".join(versions) if versions else "")).strip()
+
+
+NO_CONFIRMED_TEMPLATE = ("В каталоге не найдено предложений с подтверждённой "
+                         "совместимостью с {label}")
+NEEDS_CHECK_NOTE = "Совместимость требует проверки"
+
+
 def build_top4(result: dict, reqs: dict | None = None) -> dict:
-    """Один явный топ-4 из четырёх разных семейств с ролями и причинами."""
+    """Один явный топ-4 из четырёх разных семейств с ролями и причинами.
+
+    Если задана обязательная ОС, считаются только SKU с подтверждённой
+    совместимостью. Явные конфликты (например, SKU только для Windows при
+    обязательной Astra Linux) не показываются вовсе, а неподтверждённые
+    аналоги уходят в отдельный список `needs_check` и не добивают топ-4.
+    """
     groups = _candidate_groups(result)
     query = result.get("effective_query") or result.get("query") or ""
     if reqs is None:
@@ -493,15 +565,33 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         # уже нормализован до «astra linux» в поле normalized.
         reqs = extract_requirements(result.get("normalized") or query)
 
+    strict_os = bool(reqs.get("os"))
     direct = [g for g in groups if g["bucket"] == "direct"]
     for_os = [g for g in groups if g["bucket"] == "for_os"]
     related = [g for g in groups if g["bucket"] == "related"]
     alternative = [g for g in groups if g["bucket"] == "alternative"]
 
     picked: list[dict] = []
+    needs_check: list[dict] = []
     seen_family: set[str] = set()
     seen_group: set[str] = set()
     used_vendors: set[str] = set()
+
+    # Категория-якорь: та же категория каталога, что у лучшего совпадения.
+    # Аналоги «требует проверки» берём только из неё — иначе в список
+    # попадают чужие продукты, совпавшие одним словом запроса.
+    anchor = (direct[0]["best"] if direct
+              else (groups[0]["best"] if groups else None))
+    anchor_category = str((anchor or {}).get("category_id") or "")
+    anchor_path = normalize_text((anchor or {}).get("category_path") or "")
+
+    def same_category(group: dict) -> bool:
+        offer = group["best"]
+        category = str(offer.get("category_id") or "")
+        if anchor_category and category:
+            return category == anchor_category
+        path = normalize_text(offer.get("category_path") or "")
+        return bool(anchor_path) and path == anchor_path
 
     def try_add(group: dict, role: str, reason: str,
                 verification: dict | None) -> bool:
@@ -542,18 +632,71 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
                 added += 1
         return added
 
+    def collect_needs_check(candidates: list[tuple[dict, dict]]) -> None:
+        """Неподтверждённые, но без явного конфликта — отдельным списком.
+
+        Только товары категории-якоря: это и есть поиск по категории среди
+        разных производителей. Одна позиция на семейство, до четырёх.
+        Внутри семейства представлять будет позиция, подходящая для новой
+        покупки (базовая лицензия или подписка), а не сопровождение.
+        """
+        pool = [(g, v) for g, v in candidates if same_category(g)]
+
+        def purchase_rank(group: dict) -> int:
+            otype = group["best"].get("offer_type") or "unknown"
+            return 0 if otype in ("base", "subscription") else 1
+
+        pool.sort(key=lambda item: (purchase_rank(item[0]),
+                                    _pref_tier(item[0]),
+                                    -item[0].get("text_score", 0),
+                                    item[0]["best"].get("price") or 1e18))
+        # Разные производители в приоритете: один вендор не показывает
+        # выбор на рынке.
+        best_by_family: dict[str, tuple[dict, dict]] = {}
+        ordered: list[tuple[dict, dict]] = []
+        seen_vendors: set[str] = set()
+        taken = {item.get("_family") for item in needs_check}
+        for repeat in (0, 1):
+            for group, verification in pool:
+                vendor = normalize_text(group["best"].get("vendor") or "")
+                if (vendor in seen_vendors) != bool(repeat):
+                    continue
+                seen_vendors.add(vendor)
+                fam = family_id(group["best"])
+                if fam in taken:
+                    continue
+                if fam not in best_by_family:
+                    best_by_family[fam] = (group, verification)
+                    ordered.append((group, verification))
+        for group, verification in ordered:
+            if len(needs_check) >= TOP4_SIZE:
+                break
+            entry = _entry(group, ROLE_ANALOG,
+                           "; ".join(verification.get("problems") or [])
+                           or "совместимость не подтверждена", verification)
+            entry["needs_check"] = True
+            entry["verification_note"] = NEEDS_CHECK_NOTE
+            entry["_family"] = family_id(group["best"])
+            needs_check.append(entry)
+
     # 1. Прямые совпадения.
     direct_pool = [(g, verify_requirements(g["best"], reqs)) for g in direct]
-    # Прямые совпадения не обязаны проходить допродажную проверку, но
-    # несоответствие обязательному условию (ОС/версия/архитектура/тип
-    # лицензии) — повод не ставить их первыми.
     has_hard_condition = bool(reqs.get("os") or reqs.get("version")
                               or reqs.get("arch") or reqs.get("license_type")
                               or (reqs.get("wants_os") and not reqs.get("os")))
-    direct_ok = [(g, v) for g, v in direct_pool
-                 if v["verified"] or not has_hard_condition]
-    ok_ids = {id(g) for g, _ in direct_ok}
-    direct_rejected = [(g, v) for g, v in direct_pool if id(g) not in ok_ids]
+    if strict_os:
+        # Только подтверждённые: неподтверждённые не считаются результатом.
+        direct_ok = [(g, v) for g, v in direct_pool if v["verified"]]
+        direct_rejected = [(g, v) for g, v in direct_pool
+                           if not v["verified"] and not v.get("conflict")]
+        collect_needs_check(direct_rejected)
+    else:
+        direct_ok = [(g, v) for g, v in direct_pool
+                     if not v.get("conflict")
+                     and (v["verified"] or not has_hard_condition)]
+        direct_rejected = [(g, v) for g, v in direct_pool
+                           if id(g) not in {id(x) for x, _ in direct_ok}
+                           and not v.get("conflict")]
     fill(direct_ok, ROLE_DIRECT, lambda g, v: g.get("reason") or "", TOP4_SIZE)
 
     # 2. Проверенные сопутствующие товары (товары для ОС и related).
@@ -585,17 +728,32 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         fill(analog_pool, analog_role, analog_reason,
              TOP4_SIZE - len(picked))
 
+    # 3б. При обязательной ОС неподтверждённые аналоги — только в
+    # отдельный список, без добора топ-4.
+    if strict_os:
+        extra: list[tuple[dict, dict]] = []
+        for group in for_os + related + alternative:
+            if any(id(group) == id(g) for g, _ in direct_rejected):
+                continue
+            check = verify_requirements(group["best"], reqs)
+            if not check["verified"] and not check.get("conflict"):
+                extra.append((group, check))
+        collect_needs_check(extra)
+
     # 4. Если прямые не прошли проверку — вернуть их как резерв в конце.
-    if len(picked) < TOP4_SIZE and direct_rejected:
+    # При обязательной ОС этого не делаем: неподходящими не добиваем.
+    if len(picked) < TOP4_SIZE and direct_rejected and not strict_os:
         fill(direct_rejected, ROLE_ANALOG,
              lambda g, v: ("не подтверждено: " + "; ".join(v["problems"])
                            if v["problems"] else "резерв"),
              TOP4_SIZE - len(picked))
 
     # 5. Совсем нет проверенных — показать ближайший аналог с пометкой,
-    # чтобы пользователь не получил пустой топ-4.
-    if not picked and alternative:
-        loose = [(g, verify_requirements(g["best"], reqs)) for g in alternative]
+    # чтобы пользователь не получил пустой топ-4. При обязательной ОС
+    # аналог без подтверждения не считается результатом.
+    if not picked and alternative and not strict_os:
+        loose = [(g, verify_requirements(g["best"], reqs)) for g in alternative
+                 if not verify_requirements(g["best"], reqs).get("conflict")]
         fill(loose, ROLE_ANALOG,
              lambda g, v: ("не подтверждено: " + "; ".join(v["problems"])
                            if v["problems"] else "резерв"),
@@ -605,6 +763,11 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
     if picked and all(it.get("reserve") for it in picked):
         reserve_note = ("все найденные позиции без цены и/или недоступны — "
                         "показаны как резерв; покупка недоступна")
+
+    label = compat_requirement_label(reqs)
+    no_confirmed = ""
+    if strict_os and not picked:
+        no_confirmed = NO_CONFIRMED_TEMPLATE.format(label=label or reqs["os"])
 
     shortfall = len(picked) < TOP4_SIZE
     reason = ""
@@ -616,12 +779,20 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         if not groups:
             reason = "в каталоге нет подходящих позиций"
 
+    for item in needs_check:
+        item.pop("_family", None)
+
     return {
         "items": picked,
         "count": len(picked),
+        "verified_count": len(picked),
         "size": TOP4_SIZE,
+        "strict_os": strict_os,
+        "needs_check": needs_check,
+        "needs_check_note": NEEDS_CHECK_NOTE if needs_check else "",
+        "no_confirmed_message": no_confirmed,
         "shortfall": shortfall,
-        "shortfall_reason": reason,
+        "shortfall_reason": no_confirmed or reason,
         "all_reserve": bool(picked) and all(it.get("reserve") for it in picked),
         "reserve_note": reserve_note,
         "requirements": {
@@ -639,3 +810,4 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
             "alternative": len(alternative),
         },
     }
+

@@ -28,9 +28,10 @@ from dataclasses import dataclass, field
 import httpx
 
 import organizer_search as osr
-from organizer_index import (OFFER_TYPE_LABELS, connect, get_offer, get_meta,
-                             normalize_text)
+from organizer_index import (OFFER_TYPE_LABELS, STOPWORDS, connect, get_offer,
+                             get_meta, normalize_text, query_tokens)
 from selection import COMPAT_RULES, build_top4, extract_requirements
+from query_normalize import layout_note
 
 DEFAULT_BASE_URL = "https://llm.api.cloud.yandex.net/v1"
 DEFAULT_MODEL = "gpt://{folder}/yandexgpt/latest"
@@ -46,6 +47,19 @@ DEFAULT_GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
 # Ориентир по тарифу GigaChat для физлиц, ₽ за 1000 токенов.
 # Значение расчётное и подлежит сверке с тарифом выбранной модели.
 GIGACHAT_PRICE_PER_1K_TOKENS_RUB = 0.065
+# Проверенные тарифы из таблицы документации Сбера (₽ за 1000 токенов).
+# Модель, которой здесь нет (например, GigaChat-2), считается без
+# подтверждённого тарифа — стоимость не показываем.
+GIGACHAT_VERIFIED_TARIFFS = {
+    "gigachat-2-lite": 0.065,
+    "gigachat-2-pro": 0.5,
+    "gigachat-2-max": 0.65,
+}
+
+
+def verified_tariff(model: str) -> float | None:
+    """Тариф ₽/1000 токенов, если он подтверждён документацией модели."""
+    return GIGACHAT_VERIFIED_TARIFFS.get((model or "").strip().lower())
 
 MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "800"))
 TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "20"))
@@ -392,6 +406,126 @@ def _merge_requirements(server: dict, model: dict, previous: dict | None) -> dic
     return reqs
 
 
+# ── сохранение исходного намерения ────────────────────────────────
+#
+# Модель может сузить общий запрос до конкретного бренда: на фразу
+# «нужно резервное копирование» ответить query «кибер бэкап». Если
+# пользователь бренд не называл, искать нужно по категории и синонимам
+# среди разных производителей. Правило опирается на данные каталога:
+# токен считается брендовым, если он встречается как вендор в индексе.
+
+_BRAND_STOP_TOKENS = {
+    "лиценз", "подписк", "сервер", "серверн", "программ", "обеспечен",
+    "резервн", "копирован", "бэкап", "backup", "восстановлен", "защит",
+    "антивирус", "почт", "файл", "данн", "систем", "платформ", "облачн",
+    "редакц", "верси", "пакет", "комплект", "для", "windows", "linux",
+    "astra", "астра", "unix", "macos",
+}
+
+_BRAND_CACHE: dict[int, frozenset] = {}
+
+
+def _vendor_tokens(conn) -> frozenset:
+    """Токены вендоров из индекса (кеш на соединение)."""
+    cached = _BRAND_CACHE.get(id(conn))
+    if cached is not None:
+        return cached
+    tokens: set[str] = set()
+    for (vendor,) in conn.execute("SELECT DISTINCT vendor FROM offers"):
+        for token in normalize_text(vendor or "").split():
+            cleaned = re.sub(r"[^0-9a-zа-яё]", "", token)
+            if len(cleaned) >= 3:
+                tokens.add(cleaned)
+    data = frozenset(tokens)
+    _BRAND_CACHE[id(conn)] = data
+    return data
+
+
+def _introduced_brand(query: str, message: str, conn) -> str:
+    """Бренд, который модель добавила в запрос, но пользователь не называл.
+
+    Возвращает найденный брендовый токен или пустую строку. Сравнение идёт
+    по основам: «кибер бэкап» из ответа модели против «резервное
+    копирование» в реплике пользователя.
+    """
+    user_tokens = set(query_tokens(message)) | set(normalize_text(message).split())
+    brand_tokens = _vendor_tokens(conn)
+    for token in query_tokens(query):
+        if token in _BRAND_STOP_TOKENS or token in user_tokens:
+            continue
+        if any(token in brand or brand in token
+               for brand in brand_tokens if len(brand) >= 3):
+            return token
+    return ""
+
+
+def _intent_query(message: str) -> str:
+    """Запрос по исходному намерению без бренда и уточнений.
+
+    Берёт из реплики только слова задачи: «сервер уже есть, на нём Astra
+    Linux 1.7, нужно резервное копирование» → «резервное копирование».
+    """
+    queries = _intent_queries(message)
+    return queries[0] if queries else ""
+
+
+def _intent_queries(message: str) -> list[str]:
+    """Синонимы запроса по намерению: категория и другие названия.
+
+    «Резервное копирование», «бэкап» и «backup» — одна задача, поэтому
+    поиск идёт по всем формулировкам сразу: так в выдачу попадают разные
+    производители, а не только тот, чьё название совпало буквально.
+    """
+    low = normalize_text(message)
+    if any(word in low for word in ("резервн", "копирован", "бэкап", "backup",
+                                    "восстановлен")):
+        return ["резервное копирование", "бэкап", "backup"]
+    if "антивирус" in low or "защит" in low:
+        return ["антивирус"]
+    return []
+
+
+_BUCKET_PRIORITY = {"direct": 0, "for_os": 1, "related": 2, "alternative": 3}
+
+
+def _merge_search_results(results: list[dict]) -> dict:
+    """Объединяет выдачу нескольких синонимичных запросов без дублей."""
+    if len(results) == 1:
+        return results[0]
+    by_key: dict[str, dict] = {}
+    for result in results:
+        for group in result.get("groups") or []:
+            key = group.get("key") or group["best"]["id"]
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = group
+                continue
+            prev_rank = (_BUCKET_PRIORITY.get(prev.get("bucket"), 9),
+                         -prev.get("text_score", 0))
+            new_rank = (_BUCKET_PRIORITY.get(group.get("bucket"), 9),
+                        -group.get("text_score", 0))
+            if new_rank < prev_rank:
+                by_key[key] = group
+
+    groups = sorted(by_key.values(),
+                    key=lambda g: (-g.get("text_score", 0), -g.get("score", 0)))
+    buckets: dict[str, list] = {}
+    for group in groups:
+        buckets.setdefault(group["bucket"], []).append(group)
+
+    tokens: list[str] = []
+    for result in results:
+        for token in result.get("tokens") or []:
+            if token not in tokens:
+                tokens.append(token)
+
+    merged = dict(results[0])
+    merged.update({"groups": groups, "buckets": buckets, "tokens": tokens,
+                   "total": len(groups), "shortfall": len(groups) < 4,
+                   "sections": None, "bucket_titles": {}})
+    return merged
+
+
 class GigaChatProvider:
     """GigaChat для физлиц: один вызов модели на реплику.
 
@@ -642,15 +776,45 @@ def _os_name(text: str) -> str:
     return " ".join(match.group(1).split()).rstrip(".")
 
 
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9._-]*")
+_GENERIC_LATIN = {"server", "backup", "software", "hardware"}
+
+
+def _keep_latin(base: str, text: str) -> str:
+    """Дополняет категорию латинскими названиями и артикулами из запроса.
+
+    «сервер Dell» не должен превращаться в «сервер»: распознанные названия
+    (бренды, линейки, артикулы) сохраняются рядом с категорией.
+    """
+    extra: list[str] = []
+    have = {w.lower() for w in _LATIN_WORD_RE.findall(base)}
+    for word in _LATIN_WORD_RE.findall(text or ""):
+        low = word.lower()
+        if len(low) < 2 or low in _GENERIC_LATIN or low in STOPWORDS:
+            continue
+        if low in have:
+            continue
+        have.add(low)
+        extra.append(word)
+    return " ".join([base, *extra]).strip() if extra else base
+
+
 def _mock_query(text: str) -> tuple[str, str]:
-    """Запрос к каталогу и, если нужно, один короткий вопрос."""
+    """Запрос к каталогу и, если нужно, один короткий вопрос.
+
+    Бренд не подставляется: «нужно резервное копирование» ищется как
+    «резервное копирование», а не как «кибер бэкап». Бренд используется,
+    только если пользователь назвал его сам.
+    """
     low = (text or "").lower().replace("ё", "е")
     if "резервн" in low or "бэкап" in low or "backup" in low:
-        return "кибер бэкап", ""
+        if "кибер" in low:
+            return "кибер бэкап", ""
+        return "резервное копирование", ""
     if "сервер" in low and ("по" in low.split() or "программ" in low):
         return "ПО для сервера", ""
     if "сервер" in low:
-        return "сервер", ""
+        return _keep_latin("сервер", text), ""
     if "anydesk" in low:
         return "anydesk", ""
     if "кибер" in low:
@@ -752,15 +916,25 @@ class Consultant:
     def ask(self, session_id: str, message: str) -> dict:
         session = self.get_session(session_id)
         started = time.perf_counter()
-        message = (message or "").strip()
-        if not message:
+        original = (message or "").strip()
+        if not original:
             return {"answer": "Введите вопрос.", "cards": [],
                     "provider": self.provider.name, "session": session.id}
 
+        # Общая с обычным поиском нормализация раскладки — до вызова модели,
+        # чтобы модель не разбирала «cthdth» как бренд или опечатку.
+        message, layout_fixes = osr.fix_layout(self.catalog.conn, original)
         session.messages.append({"role": "user", "content": message})
         if hasattr(self.provider, "extract"):
-            return self._ask_extract(session, message, started)
-        return self._ask_tools(session, message, started)
+            result = self._ask_extract(session, message, started)
+        else:
+            result = self._ask_tools(session, message, started)
+        result["layout_fixes"] = layout_fixes
+        if layout_fixes:
+            result["original_message"] = original
+            note = layout_note(layout_fixes)
+            result["answer"] = note + "\n" + (result.get("answer") or "")
+        return result
 
     def _ask_extract(self, session: Session, message: str,
                      started: float) -> dict:
@@ -797,13 +971,38 @@ class Consultant:
         if not query:
             local_query, _ = _mock_query(message)
             query = local_query or message
+
+        # Бренд, введённый моделью, но не названный пользователем —
+        # не сужаем поиск: ищем по категории и синонимам.
+        brand = _introduced_brand(query, message, self.catalog.conn)
+        search_queries = [query]
+        if brand:
+            intent_q = _intent_query(message)
+            if intent_q:
+                search_queries = [intent_q]
+            else:
+                local_q, _ = _mock_query(message)
+                search_queries = [local_q or message]
+        if not brand:
+            # Синонимы добавляем всегда, когда бренд не назван пользователем:
+            # «резервное копирование» и «бэкап» — одна задача.
+            for synonym in _intent_queries(message):
+                if synonym not in search_queries:
+                    search_queries.append(synonym)
+        query = search_queries[0]
+
         reqs = _merge_requirements(server_reqs,
                                    extracted.get("requirements") or {},
                                    previous)
 
-        result = osr.search(self.catalog.conn, query, limit=12)
+        results = [osr.search(self.catalog.conn, q, limit=12)
+                   for q in search_queries]
+        result = _merge_search_results(results)
         top4 = build_top4(result, reqs)
-        cards = top4.get("items") or []
+        confirmed = top4.get("items") or []
+        needs_check = top4.get("needs_check") or []
+        # В карточки попадают подтверждённые, затем — требующие проверки.
+        cards = confirmed + needs_check
 
         answer = _compose_answer(query, top4, reqs, used_model, fallback_reason,
                                  self.provider.name,
@@ -818,16 +1017,22 @@ class Consultant:
 
         elapsed = round((time.perf_counter() - started) * 1000)
         tokens = session.usage["prompt"] + session.usage["completion"]
-        price = (GIGACHAT_PRICE_PER_1K_TOKENS_RUB
-                 if self.provider.name == "gigachat"
-                 else PRICE_PER_1K_TOKENS_RUB)
+        model_name = getattr(self.provider, "model", "")
+        tariff = (verified_tariff(model_name)
+                  if self.provider.name == "gigachat" else None)
+        api_total = int(api_usage.get("total_tokens") or 0)
+        cost = None
+        if tariff is not None and api_total > 0:
+            cost = {"amount_rub": round(api_total / 1000 * tariff, 4),
+                    "price_per_1k_rub": tariff, "currency": "RUB",
+                    "estimated": True}
         return {
             "answer": answer,
             "cards": cards,
             "top4": top4,
             "clarification": False,
             "provider": self.provider.name,
-            "model": getattr(self.provider, "model", ""),
+            "model": model_name,
             "live": used_model,
             "used_model": used_model,
             "fallback_reason": fallback_reason,
@@ -837,11 +1042,15 @@ class Consultant:
             "requirements": {key: reqs.get(key) for key in
                              ("os", "version", "arch", "license_type",
                               "wants_os")},
+            "verified_count": top4.get("verified_count", len(confirmed)),
+            "needs_check_count": len(needs_check),
+            "no_confirmed_message": top4.get("no_confirmed_message") or "",
             "calls": calls,
             "latency_ms": elapsed,
             "usage": dict(session.usage),
             "api_usage": api_usage,
-            "cost_rub": round(tokens / 1000 * price, 4),
+            "cost": cost,
+            "cost_rub": cost["amount_rub"] if cost else None,
         }
 
     def _ask_tools(self, session: Session, message: str,
@@ -927,7 +1136,8 @@ class Consultant:
             "latency_ms": elapsed,
             "usage": dict(session.usage),
             "api_usage": {},
-            "cost_rub": round(tokens / 1000 * PRICE_PER_1K_TOKENS_RUB, 4),
+            "cost": None,
+            "cost_rub": None,
         }
 
 
@@ -936,6 +1146,7 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
                     model: str) -> str:
     """Текст ответа без домыслов модели: факты только из индекса и правил."""
     items = top4.get("items") or []
+    needs_check = top4.get("needs_check") or []
     lines: list[str] = []
     if used_model:
         lines.append(
@@ -952,8 +1163,12 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
     if summary:
         lines.append(f"Обязательные условия: {summary}.")
 
+    no_confirmed = top4.get("no_confirmed_message") or ""
+    if no_confirmed:
+        lines.append(no_confirmed + ".")
+
     if items:
-        lines.append("Топ-4 из разных семейств:")
+        lines.append(f"Подтверждённых результатов: {len(items)}.")
         for index, item in enumerate(items, 1):
             lines.append(
                 f"{index}. {item['name']} — {item['type_label']}, "
@@ -963,8 +1178,18 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
                 lines.append(f"   Основание: {'; '.join(item['facts'])}.")
             if item.get("problems"):
                 lines.append(f"   Не подтверждено: {'; '.join(item['problems'])}.")
-    else:
+    elif not no_confirmed:
         lines.append(f"По запросу «{query}» в каталоге ничего не нашлось.")
+
+    if needs_check:
+        note = top4.get("needs_check_note") or "Совместимость требует проверки"
+        lines.append(f"{note} (в подтверждённые результаты не входят):")
+        for index, item in enumerate(needs_check, 1):
+            lines.append(
+                f"{index}. {item['name']} — {item['type_label']}, "
+                f"{item['price_text']}, {item['available_text']}.")
+            if item.get("problems"):
+                lines.append(f"   Причина: {'; '.join(item['problems'])}.")
 
     if top4.get("shortfall") and items:
         lines.append(top4.get("shortfall_reason") or "")
