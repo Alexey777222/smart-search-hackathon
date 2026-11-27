@@ -1,20 +1,19 @@
 """ai_consultant.py — ИИ-консультант поверх локального индекса каталога.
 
-Провайдер: YandexGPT Pro 5.1 через OpenAI-совместимый REST API Яндекса
-(https://llm.api.cloud.yandex.net/v1, заголовок Authorization: Api-Key).
-Ключ и folder_id берутся из окружения, имена переменных — в .env.example.
+Провайдер выбирается переменной AI_PROVIDER:
+  * gigachat — GigaChat для физлиц (scope GIGACHAT_API_PERS) через
+    официальный Python SDK `gigachat`. Модель делает ОДИН вызов на реплику
+    и только выделяет поисковый запрос и обязательные условия; товары,
+    цены, наличие, ссылки и совместимость берутся из локального индекса
+    и правил подборки (selection.py).
+  * yandexgpt — YandexGPT Pro 5.1 через OpenAI-совместимый REST API
+    (https://llm.api.cloud.yandex.net/v1, заголовок Authorization: Api-Key).
+  * без ключа — имитация провайдера (mock): та же структура ответа, но
+    решение принимает локальная логика. Ответ явно помечается как
+    полученный без модели.
 
-Модель получает ровно две функции только для чтения:
-  * search_catalog(query, limit)  — поиск по локальному индексу;
-  * get_related(offer_id, limit)  — соседние предложения с основанием.
-
-Карточки товаров собираются на сервере из действительных ID индекса:
-модель не может придумать цену, ссылку или предложение, которого нет.
-
-Без ключа работает имитация провайдера: тот же протокол (system prompt,
-tools, результаты функций), но решение принимает локальная логика.
-Это позволяет показать диалог до подключения ключа; живой вызов ещё
-предстоит проверить.
+Для GigaChat TLS-проверка НЕ отключается: путь к корневому сертификату
+НУЦ Минцифры задаётся в GIGACHAT_CA_BUNDLE_FILE (см. .env.example).
 """
 
 from __future__ import annotations
@@ -29,7 +28,9 @@ from dataclasses import dataclass, field
 import httpx
 
 import organizer_search as osr
-from organizer_index import OFFER_TYPE_LABELS, connect, get_offer, get_meta
+from organizer_index import (OFFER_TYPE_LABELS, connect, get_offer, get_meta,
+                             normalize_text)
+from selection import COMPAT_RULES, build_top4, extract_requirements
 
 DEFAULT_BASE_URL = "https://llm.api.cloud.yandex.net/v1"
 DEFAULT_MODEL = "gpt://{folder}/yandexgpt/latest"
@@ -37,6 +38,14 @@ DEFAULT_MODEL = "gpt://{folder}/yandexgpt/latest"
 # Источник: открытые тарифы Yandex AI Studio; значение расчётное и
 # подлежит сверке с договором.
 PRICE_PER_1K_TOKENS_RUB = 0.8
+
+# GigaChat: актуальный endpoint и scope для физлиц (документация Сбера).
+DEFAULT_GIGACHAT_BASE_URL = "https://api.giga.chat/v1"
+DEFAULT_GIGACHAT_MODEL = "GigaChat-2"
+DEFAULT_GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
+# Ориентир по тарифу GigaChat для физлиц, ₽ за 1000 токенов.
+# Значение расчётное и подлежит сверке с тарифом выбранной модели.
+GIGACHAT_PRICE_PER_1K_TOKENS_RUB = 0.065
 
 MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "800"))
 TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "20"))
@@ -258,6 +267,234 @@ class ProviderError(Exception):
     pass
 
 
+# ── GigaChat: разбор реплики одним вызовом ─────────────────────────
+
+EXTRACT_PROMPT = """Ты — разборщик запросов магазина Softline. По фразе \
+пользователя и контексту диалога выдели:
+1. query — короткий поисковый запрос к каталогу (продукт, категория или задача);
+2. requirements — обязательные условия, которые пользователь назвал явно:
+   os (операционная система), version (список версий), arch (архитектура),
+   license_type (renewal/support/addon/subscription), wants_os (bool).
+
+Правила:
+- Не придумывай условия, которых нет в фразе или контексте.
+- Сохраняй ранее названные условия из контекста, если пользователь их не отменил.
+- Версию ОС указывай отдельно от названия: «Astra Linux 1.7» → os «Astra Linux Special Edition», version ["1.7"].
+- Для задачи «резервное копирование» query — «кибер бэкап».
+- Если пользователь просит сервер, query — «сервер»; если ПО для сервера — «ПО для сервера».
+- Ответ — ТОЛЬКО JSON без пояснений и без markdown:
+{"query": "...", "requirements": {"os": null, "version": [], "arch": null, "license_type": null, "wants_os": false}}
+"""
+
+_ARCH_CANON = {"x86-64", "aarch64", "arm", "e2k"}
+_LICENSE_TYPES = {"renewal", "support", "addon", "subscription"}
+_VERSION_RE = re.compile(r"^(?:19|20)\d{2}$|^\d+\.\d+(?:\.\d+)?$")
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.I | re.M)
+
+
+def _extract_json_object(text: str) -> dict:
+    """Достаёт JSON-объект из ответа модели, отбрасывая markdown-обёртку."""
+    text = (text or "").strip()
+    if not text:
+        return {}
+    cleaned = _FENCE_RE.sub("", text).strip()
+    for candidate in (cleaned, text):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def _canonical_os(value) -> str | None:
+    """Приводит ОС из ответа модели к каноническому названию правила."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    low = normalize_text(value)
+    for rule in COMPAT_RULES:
+        if rule["kind"] != "os":
+            continue
+        if normalize_text(rule["product"]) in low or any(
+                alias in low for alias in rule["aliases"]):
+            return rule["product"]
+    return None
+
+
+def _clean_model_requirements(raw) -> dict:
+    """Серверная валидация условий из ответа модели.
+
+    Всё, что не прошло проверку по допустимым значениям, отбрасывается:
+    модель не может расширить набор условий произвольными строками.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    os_name = _canonical_os(raw.get("os"))
+    if os_name:
+        out["os"] = os_name
+    versions = []
+    for value in raw.get("version") or []:
+        if isinstance(value, str) and _VERSION_RE.match(value.strip()):
+            versions.append(value.strip())
+    if versions:
+        out["version"] = versions
+    arch = raw.get("arch")
+    if isinstance(arch, str) and arch.strip().lower() in _ARCH_CANON:
+        out["arch"] = arch.strip().lower()
+    license_type = raw.get("license_type")
+    if isinstance(license_type, str) and license_type.strip().lower() in _LICENSE_TYPES:
+        out["license_type"] = license_type.strip().lower()
+    if isinstance(raw.get("wants_os"), bool):
+        out["wants_os"] = raw["wants_os"]
+    return out
+
+
+def _merge_requirements(server: dict, model: dict, previous: dict | None) -> dict:
+    """Объединяет локальные, модельные и унаследованные условия.
+
+    Локальные (regex) условия приоритетнее модельных. Версии из прошлой
+    реплики переносятся только для той же ОС — так «Astra Linux 1.7»
+    не теряется при уточнении задачи.
+    """
+    previous = previous or {}
+    reqs = {
+        "os": server.get("os") or model.get("os"),
+        "os_rule": None,
+        "version": [],
+        "arch": server.get("arch") or model.get("arch"),
+        "license_type": server.get("license_type") or model.get("license_type"),
+        "exclude": list(server.get("exclude") or []),
+        "wants_os": bool(server.get("wants_os") or model.get("wants_os")),
+    }
+    for rule in COMPAT_RULES:
+        if rule["kind"] == "os" and reqs["os"] == rule["product"]:
+            reqs["os_rule"] = rule["id"]
+            break
+
+    versions: list[str] = []
+    prev_versions = (previous.get("version") or []
+                     if previous.get("os") == reqs["os"] else [])
+    for source in (server.get("version"), model.get("version"), prev_versions):
+        for version in source or []:
+            if version not in versions:
+                versions.append(version)
+    reqs["version"] = versions
+    return reqs
+
+
+class GigaChatProvider:
+    """GigaChat для физлиц: один вызов модели на реплику.
+
+    Модель только выделяет поисковый запрос и обязательные условия и
+    возвращает строгий JSON. Сервер проверяет ответ и подбирает товары
+    по локальному индексу. TLS-проверка не отключается: сертификат НУЦ
+    Минцифры подключается через GIGACHAT_CA_BUNDLE_FILE.
+    """
+
+    name = "gigachat"
+
+    def __init__(self):
+        self.credentials = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+        self.base_url = os.getenv("GIGACHAT_BASE_URL",
+                                  DEFAULT_GIGACHAT_BASE_URL).rstrip("/")
+        self.model = (os.getenv("GIGACHAT_MODEL", "").strip()
+                      or DEFAULT_GIGACHAT_MODEL)
+        self.scope = (os.getenv("GIGACHAT_SCOPE", "").strip()
+                      or DEFAULT_GIGACHAT_SCOPE)
+        self.ca_bundle_file = (os.getenv("GIGACHAT_CA_BUNDLE_FILE", "").strip()
+                               or None)
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.credentials)
+
+    def _client(self):
+        from gigachat import GigaChat
+
+        kwargs = {
+            "base_url": self.base_url,
+            "credentials": self.credentials,
+            "scope": self.scope,
+            "model": self.model,
+            "timeout": TIMEOUT_SECONDS,
+        }
+        if self.ca_bundle_file:
+            kwargs["ca_bundle_file"] = self.ca_bundle_file
+        # verify_ssl_certs намеренно не передаём: проверка сертификата включена.
+        return GigaChat(**kwargs)
+
+    def extract(self, message: str, context: dict | None = None) -> dict:
+        from gigachat.exceptions import (AuthenticationError, ForbiddenError,
+                                         GigaChatException, RateLimitError)
+
+        if not self.ready:
+            raise ProviderError("нет ключа GIGACHAT_CREDENTIALS")
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": EXTRACT_PROMPT},
+                {"role": "user", "content": json.dumps(
+                    {"message": message, "context": context or {}},
+                    ensure_ascii=False)},
+            ],
+            "model_options": {"temperature": 0.0, "max_tokens": MAX_TOKENS},
+        }
+        try:
+            with self._client() as client:
+                reply = client.chat.create(payload)
+        except RateLimitError as exc:
+            raise ProviderError(
+                "исчерпана квота или превышен лимит запросов GigaChat") from exc
+        except (AuthenticationError, ForbiddenError) as exc:
+            raise ProviderError(f"доступ к GigaChat запрещён: {exc}") from exc
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            raise ProviderError(f"тайм-аут {TIMEOUT_SECONDS:.0f} с") from exc
+        except GigaChatException as exc:
+            raise ProviderError(f"GigaChat: {exc}") from exc
+        except Exception as exc:  # сеть, TLS, неожиданный ответ SDK
+            raise ProviderError(f"сеть/клиент GigaChat: {exc}") from exc
+
+        message_obj = (reply.messages or [None])[0]
+        content = ""
+        if message_obj is not None and message_obj.content:
+            if isinstance(message_obj.content, str):
+                content = message_obj.content
+            else:
+                content = "".join(getattr(part, "text", "") or ""
+                                  for part in message_obj.content)
+        data = _extract_json_object(content)
+        query = data.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ProviderError("невалидный ответ модели: нет поискового запроса")
+
+        usage = reply.usage
+        api_usage = {
+            "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        }
+        return {
+            "query": query.strip()[:200],
+            "requirements": _clean_model_requirements(data.get("requirements")),
+            "used_model": True,
+            "model": self.model,
+            "usage": {"prompt": api_usage["input_tokens"],
+                      "completion": api_usage["output_tokens"]},
+            "api_usage": api_usage,
+            "raw_content": content[:1000],
+        }
+
+
 class YandexProvider:
     """YandexGPT Pro 5.1 через OpenAI-совместимый REST API."""
 
@@ -322,14 +559,42 @@ class MockProvider:
     """Имитация провайдера без ключа.
 
     Протокол тот же, что у YandexGPT: сначала вызов функции, затем ответ.
-    Решение принимает локальная логика по тексту пользователя.
+    Для режима GigaChat доступен метод extract(): он возвращает ту же
+    структуру, что и живой провайдер, но решение принимает локальная
+    логика. Ответ всегда помечается как полученный без модели.
     """
 
     name = "mock"
 
+    def __init__(self, reason: str = "ключ провайдера не задан"):
+        self.reason = reason
+        self.model = "mock"
+
     @property
     def ready(self) -> bool:
         return True
+
+    def extract(self, message: str, context: dict | None = None) -> dict:
+        """Локальный аналог разбора реплики: запрос и обязательные условия."""
+        query, clarification = _mock_query(message)
+        server = extract_requirements(message)
+        model_reqs = {
+            "os": server.get("os"),
+            "version": list(server.get("version") or []),
+            "arch": server.get("arch"),
+            "license_type": server.get("license_type"),
+            "wants_os": bool(server.get("wants_os")),
+        }
+        return {
+            "query": query,
+            "requirements": _clean_model_requirements(model_reqs),
+            "used_model": False,
+            "model": self.model,
+            "usage": {"prompt": 0, "completion": 0},
+            "api_usage": {},
+            "clarification": clarification,
+            "raw_content": "",
+        }
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
         user_text = ""
@@ -434,8 +699,17 @@ def _mock_answer(user_text: str, payload: dict) -> str:
 
 
 def build_provider():
-    provider = YandexProvider()
-    return provider if provider.ready else MockProvider()
+    """Выбор провайдера по AI_PROVIDER с безопасным откатом в заглушку."""
+    choice = os.getenv("AI_PROVIDER", "").strip().lower()
+    if choice == "gigachat":
+        provider = GigaChatProvider()
+        return provider if provider.ready else MockProvider(
+            "нет ключа GIGACHAT_CREDENTIALS")
+    yandex = YandexProvider()
+    if choice in ("", "yandexgpt"):
+        return yandex if yandex.ready else MockProvider(
+            "нет ключа YANDEX_API_KEY/YANDEX_FOLDER_ID")
+    return MockProvider(f"неизвестный AI_PROVIDER={choice}")
 
 
 # ── консультант ────────────────────────────────────────────────────
@@ -483,11 +757,100 @@ class Consultant:
             return {"answer": "Введите вопрос.", "cards": [],
                     "provider": self.provider.name, "session": session.id}
 
+        session.messages.append({"role": "user", "content": message})
+        if hasattr(self.provider, "extract"):
+            return self._ask_extract(session, message, started)
+        return self._ask_tools(session, message, started)
+
+    def _ask_extract(self, session: Session, message: str,
+                     started: float) -> dict:
+        """Один вызов модели: разбор запроса + локальная подборка товаров."""
+        server_reqs = extract_requirements(message)
+        previous = dict(session.requirements or {})
+
+        extracted: dict = {}
+        used_model = False
+        fallback_reason = ""
+        calls = 0
+        api_usage: dict = {}
+
+        if self.provider.name == "mock":
+            extracted = self.provider.extract(message, session.context_summary())
+        elif session.calls >= MAX_CALLS_PER_SESSION:
+            fallback_reason = ("достигнут лимит обращений к модели в сессии "
+                               f"({MAX_CALLS_PER_SESSION})")
+        else:
+            session.calls += 1
+            calls = 1
+            try:
+                extracted = self.provider.extract(message,
+                                                  session.context_summary())
+                used_model = bool(extracted.get("used_model"))
+                api_usage = extracted.get("api_usage") or {}
+                usage = extracted.get("usage") or {}
+                session.usage["prompt"] += int(usage.get("prompt") or 0)
+                session.usage["completion"] += int(usage.get("completion") or 0)
+            except ProviderError as exc:
+                fallback_reason = str(exc)
+
+        query = (extracted.get("query") or "").strip()
+        if not query:
+            local_query, _ = _mock_query(message)
+            query = local_query or message
+        reqs = _merge_requirements(server_reqs,
+                                   extracted.get("requirements") or {},
+                                   previous)
+
+        result = osr.search(self.catalog.conn, query, limit=12)
+        top4 = build_top4(result, reqs)
+        cards = top4.get("items") or []
+
+        answer = _compose_answer(query, top4, reqs, used_model, fallback_reason,
+                                 self.provider.name,
+                                 getattr(self.provider, "model", ""))
+
+        session.intent = result["intent"]["name"]
+        session.requirements = reqs
+        if cards:
+            session.product = cards[0]
+        session.cards = cards
+        session.messages.append({"role": "assistant", "content": answer})
+
+        elapsed = round((time.perf_counter() - started) * 1000)
+        tokens = session.usage["prompt"] + session.usage["completion"]
+        price = (GIGACHAT_PRICE_PER_1K_TOKENS_RUB
+                 if self.provider.name == "gigachat"
+                 else PRICE_PER_1K_TOKENS_RUB)
+        return {
+            "answer": answer,
+            "cards": cards,
+            "top4": top4,
+            "clarification": False,
+            "provider": self.provider.name,
+            "model": getattr(self.provider, "model", ""),
+            "live": used_model,
+            "used_model": used_model,
+            "fallback_reason": fallback_reason,
+            "session": session.id,
+            "context": session.context_summary(),
+            "query": query,
+            "requirements": {key: reqs.get(key) for key in
+                             ("os", "version", "arch", "license_type",
+                              "wants_os")},
+            "calls": calls,
+            "latency_ms": elapsed,
+            "usage": dict(session.usage),
+            "api_usage": api_usage,
+            "cost_rub": round(tokens / 1000 * price, 4),
+        }
+
+    def _ask_tools(self, session: Session, message: str,
+                   started: float) -> dict:
+        """Старый путь YandexGPT: модель вызывает функции каталога."""
         os_name = _os_name(message)
         if os_name:
             session.requirements["os"] = os_name
 
-        session.messages.append({"role": "user", "content": message})
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(session.messages[-12:])
 
@@ -556,10 +919,56 @@ class Consultant:
             "clarification": bool(answer.rstrip().endswith("?") and not cards),
             "provider": self.provider.name,
             "live": self.provider.name == "yandexgpt",
+            "used_model": self.provider.name == "yandexgpt",
+            "fallback_reason": error,
             "session": session.id,
             "context": session.context_summary(),
             "calls": calls,
             "latency_ms": elapsed,
             "usage": dict(session.usage),
+            "api_usage": {},
             "cost_rub": round(tokens / 1000 * PRICE_PER_1K_TOKENS_RUB, 4),
         }
+
+
+def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
+                    fallback_reason: str, provider_name: str,
+                    model: str) -> str:
+    """Текст ответа без домыслов модели: факты только из индекса и правил."""
+    items = top4.get("items") or []
+    lines: list[str] = []
+    if used_model:
+        lines.append(
+            f"Модель {model or provider_name} выделила запрос «{query}» и "
+            f"обязательные условия; товары, цены и наличие взяты из "
+            f"локального индекса каталога.")
+    else:
+        lines.append("Ответ получен без модели: показана локальная подборка "
+                     "по индексу каталога.")
+        if fallback_reason:
+            lines.append(f"Причина: {fallback_reason}.")
+
+    summary = (top4.get("requirements") or {}).get("summary") or ""
+    if summary:
+        lines.append(f"Обязательные условия: {summary}.")
+
+    if items:
+        lines.append("Топ-4 из разных семейств:")
+        for index, item in enumerate(items, 1):
+            lines.append(
+                f"{index}. {item['name']} — {item['type_label']}, "
+                f"{item['price_text']}, {item['available_text']} "
+                f"({item['role']}).")
+            if item.get("facts"):
+                lines.append(f"   Основание: {'; '.join(item['facts'])}.")
+            if item.get("problems"):
+                lines.append(f"   Не подтверждено: {'; '.join(item['problems'])}.")
+    else:
+        lines.append(f"По запросу «{query}» в каталоге ничего не нашлось.")
+
+    if top4.get("shortfall") and items:
+        lines.append(top4.get("shortfall_reason") or "")
+    if top4.get("reserve_note"):
+        lines.append(top4["reserve_note"])
+    return "\n".join(line for line in lines if line)
+

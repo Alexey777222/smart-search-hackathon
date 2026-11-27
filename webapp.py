@@ -24,8 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import organizer_search as osr
-from ai_consultant import (Catalog, Consultant, MAX_CALLS_PER_SESSION,
-                           PRICE_PER_1K_TOKENS_RUB, make_card)
+from ai_consultant import (Catalog, Consultant, GIGACHAT_PRICE_PER_1K_TOKENS_RUB,
+                           MAX_CALLS_PER_SESSION, PRICE_PER_1K_TOKENS_RUB,
+                           make_card)
 from selection import build_top4, extract_requirements
 
 ROOT = Path(__file__).resolve().parent
@@ -101,14 +102,22 @@ def index():
 @app.get("/api/health")
 def health():
     stats = CATALOG.stats()
+    provider = CONSULTANT.provider
     return {
         "ok": True,
         "index": stats,
         **BUILD_INFO,
-        "ai_provider": CONSULTANT.provider.name,
-        "ai_live": CONSULTANT.provider.name == "yandexgpt",
+        "ai_provider": provider.name,
+        "ai_provider_requested": os.getenv("AI_PROVIDER", "").strip().lower(),
+        "ai_model": getattr(provider, "model", ""),
+        "ai_scope": getattr(provider, "scope", ""),
+        "ai_live": provider.name in ("yandexgpt", "gigachat")
+                   and bool(getattr(provider, "ready", False)),
+        "ai_stub_reason": getattr(provider, "reason", ""),
         "ai_max_calls_per_session": MAX_CALLS_PER_SESSION,
-        "price_per_1k_tokens_rub": PRICE_PER_1K_TOKENS_RUB,
+        "price_per_1k_tokens_rub": (
+            GIGACHAT_PRICE_PER_1K_TOKENS_RUB if provider.name == "gigachat"
+            else PRICE_PER_1K_TOKENS_RUB),
     }
 
 
@@ -149,9 +158,12 @@ class ConsultRequest(BaseModel):
 @app.post("/api/session")
 def api_session():
     session = CONSULTANT.new_session()
+    provider = CONSULTANT.provider
     return {"session_id": session.id,
-            "provider": CONSULTANT.provider.name,
-            "live": CONSULTANT.provider.name == "yandexgpt"}
+            "provider": provider.name,
+            "model": getattr(provider, "model", ""),
+            "live": provider.name in ("yandexgpt", "gigachat")
+                    and bool(getattr(provider, "ready", False))}
 
 
 @app.post("/api/consult")

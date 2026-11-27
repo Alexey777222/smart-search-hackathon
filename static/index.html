@@ -287,7 +287,10 @@ async function sendChat() {
     if (!res.ok) { addMsg("bot", data.detail || "Ошибка консультанта"); return; }
     addMsg("bot", data.answer);
     renderChatCards(data.cards);
-    const mode = data.live ? "живой YandexGPT" : "имитация провайдера (ключа нет)";
+    const modelLabel = data.model || data.provider;
+    const mode = data.used_model
+      ? `живой ${data.provider} (${modelLabel})`
+      : `без модели — локальная подборка (${data.provider})`;
     $("chatStats").textContent =
       `режим: ${mode} · вызовов модели: ${data.calls} · ${data.latency_ms} мс · ` +
       `токены: ${data.usage.prompt}/${data.usage.completion} · ` +
@@ -301,11 +304,13 @@ async function loadStatus() {
   try {
     const res = await fetch("/api/health");
     const data = await res.json();
-    const ai = data.ai_live ? "живой YandexGPT" : "имитация провайдера (ключ не задан)";
+    const ai = data.ai_live
+      ? `живой ${data.ai_provider}${data.ai_model ? ` (${data.ai_model})` : ""}`
+      : `без модели — локальная подборка${data.ai_stub_reason ? ` (${data.ai_stub_reason})` : ""}`;
     $("status").innerHTML =
       `Индекс: ${data.index.offers.toLocaleString("ru-RU")} предложений, ` +
       `${data.index.groups.toLocaleString("ru-RU")} групп · собран ${esc(data.index.built_at)} · ` +
-      `ИИ: <span class="ai-tag ${data.ai_live ? "" : "mock"}">${ai}</span>`;
+      `ИИ: <span class="ai-tag ${data.ai_live ? "" : "mock"}">${esc(ai)}</span>`;
   } catch (e) {
     $("status").textContent = "не удалось получить статус";
   }

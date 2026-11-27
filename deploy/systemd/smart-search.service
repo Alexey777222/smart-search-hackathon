@@ -1,0 +1,33 @@
+[Unit]
+Description=Умный поиск Softline — веб-стенд хакатона
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/smart-search-hackathon
+
+# Переменные окружения (ключи и настройки) хранятся вне репозитория.
+EnvironmentFile=/etc/smart-search-hackathon.env
+
+# GigaChat: scope для физлиц и путь к сертификату НУЦ Минцифры.
+# Проверка TLS не отключается.
+Environment=AI_PROVIDER=gigachat
+Environment=GIGACHAT_SCOPE=GIGACHAT_API_PERS
+Environment=GIGACHAT_CA_BUNDLE_FILE=/etc/ssl/certs/russian_trusted_root_ca_pem.crt
+
+ExecStart=/opt/smart-search-hackathon/.venv/bin/python -m uvicorn webapp:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+
+# Минимальные права.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/smart-search-hackathon/data
+
+[Install]
+WantedBy=multi-user.target
