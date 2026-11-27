@@ -216,19 +216,30 @@ function renderSearch(data) {
 
   html += top4Html(data.top4);
 
-  if (data.sections && Object.keys(data.sections).length) {
-    for (const [kind, cards] of Object.entries(data.sections)) {
-      html += `<div class="section-title">${esc(KIND_TITLES[kind] || kind)} (${cards.length})</div>`;
-      html += `<div class="grid">${cards.map(cardHtml).join("")}</div>`;
-    }
-  } else if (data.buckets) {
-    for (const [bucket, cards] of Object.entries(data.buckets)) {
-      const title = (data.bucket_titles && data.bucket_titles[bucket])
-        || SECTION_TITLES[bucket] || bucket;
+  // Топ-4 уже показан отдельным блоком: те же артикулы не повторяем в
+  // секциях, иначе одна карточка видна покупателю дважды.
+  const inTop4 = new Set(((data.top4 && data.top4.items) || [])
+                          .map((it) => String(it.id)));
+  const fresh = (cards) => (cards || [])
+    .filter((c) => !inTop4.has(String(c.id)));
+
+  const sections = data.sections && Object.keys(data.sections).length
+    ? Object.entries(data.sections).map(([kind, cards]) =>
+        [KIND_TITLES[kind] || kind, fresh(cards)])
+    : (data.buckets
+       ? Object.entries(data.buckets).map(([bucket, cards]) => [
+           (data.bucket_titles && data.bucket_titles[bucket])
+             || SECTION_TITLES[bucket] || bucket,
+           fresh(cards)])
+       : []);
+  const visible = sections.filter(([, cards]) => cards.length);
+
+  if (visible.length) {
+    for (const [title, cards] of visible) {
       html += `<div class="section-title">${esc(title)} (${cards.length})</div>`;
       html += `<div class="grid">${cards.map(cardHtml).join("")}</div>`;
     }
-  } else {
+  } else if (!inTop4.size) {
     html += `<p class="empty">Ничего не найдено.</p>`;
   }
   html += `<p class="hint">Просмотрено кандидатов: ${data.candidates} · найдено карточек: ${data.total}</p></div>`;
