@@ -1542,7 +1542,7 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
 
     # ── ответ покупателю (по типу вопроса) ──────────────────────
     if question_type == "cost":
-        lines.extend(_cost_breakdown(items))
+        lines.extend(_cost_breakdown(items, needs_check))
     elif question_type == "unsuitable":
         lines.extend(_unsuitable_answer(top4, needs_check, items))
     elif question_type == "license":
@@ -1627,17 +1627,33 @@ def _default_answer(query: str, top4: dict, items: list, needs_check: list,
     return lines
 
 
-def _cost_breakdown(items: list) -> list[str]:
+def _cost_breakdown(items: list, needs_check: list | None = None) -> list[str]:
     """Расчёт стоимости: один обязательный продукт + необязательные дополнения.
 
     Несколько прямых совпадений — это альтернативы одного и того же
     продукта (разные вендоры под одну задачу), а не компоненты комплекта.
     В итог берётся одна позиция, остальные показываются как варианты
     выбора: сумма альтернатив не выдаётся за стоимость решения.
+
+    Если подтверждённого решения нет, окончательная стоимость не
+    рассчитывается, а неподтверждённые позиции показываются как
+    альтернативные варианты, требующие проверки совместимости.
     """
     lines: list[str] = []
+    pending = list(needs_check or [])
     if not items:
-        lines.append("Нет подтверждённых товаров для расчёта.")
+        lines.append("Подтверждённого решения нет — окончательная стоимость "
+                     "не рассчитана.")
+        if pending:
+            lines.append("Альтернативные варианты (требуют проверки "
+                         "совместимости, в расчёт не входят):")
+            for it in pending:
+                period = it.get("duration") or ""
+                period_text = f" ({period})" if period else ""
+                price = (it.get("price_text") or "цена не указана")
+                lines.append(f"- {it['name']}: {price} за 1 шт.{period_text}")
+            lines.append("Стоимость можно рассчитать после подтверждения "
+                         "совместимости с обязательными условиями.")
         return lines
     direct = [it for it in items if it.get("role") == "прямое совпадение"]
     optional = [it for it in items if it.get("role") != "прямое совпадение"]

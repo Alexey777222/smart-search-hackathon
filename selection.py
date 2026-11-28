@@ -691,6 +691,20 @@ NO_CONFIRMED_TEMPLATE = ("В каталоге не найдено предлож
 NEEDS_CHECK_NOTE = "Совместимость требует проверки"
 
 
+def _field_platform_conflict(offer: dict, want_family: str | None) -> bool:
+    """Поле `platform` артикула явно ограничено другой платформой.
+
+    Для списка «требует проверки» этого достаточно, чтобы не показывать
+    заведомо несовместимый SKU: если общее поле платформы называет только
+    другую ОС, кандидат не годится. Смешанная или пустая платформа
+    конфликтом не считается.
+    """
+    if not want_family:
+        return False
+    stated = sku_rules.field_platforms(offer)
+    return bool(stated) and want_family not in stated
+
+
 def build_top4(result: dict, reqs: dict | None = None) -> dict:
     """Один явный топ-4 из четырёх разных семейств с ролями и причинами.
 
@@ -813,8 +827,18 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         разных производителей. Одна позиция на семейство, до четырёх.
         Внутри семейства представлять будет позиция, подходящая для новой
         покупки (базовая лицензия или подписка), а не сопровождение.
+
+        Товары с явным конфликтом платформы по полю `platform` не включаются
+        — они заведомо несовместимы, даже как кандидаты на проверку.
         """
-        pool = [(g, v) for g, v in candidates if same_category(g)]
+        # Требуемое семейство из правила ОС или из запроса.
+        rule_obj = _RULES_BY_ID.get((reqs or {}).get("os_rule") or "")
+        want_family = ((rule_obj or {}).get("platform_family")
+                       or (reqs or {}).get("platform_family"))
+
+        pool = [(g, v) for g, v in candidates
+                if same_category(g)
+                and not _field_platform_conflict(g["best"], want_family)]
 
         def purchase_rank(group: dict) -> int:
             otype = group["best"].get("offer_type") or "unknown"
@@ -912,9 +936,11 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         fill(analog_pool, analog_role, analog_reason,
              TOP4_SIZE - len(picked))
 
-    # 3б. При обязательной ОС неподтверждённые аналоги — только в
-    # отдельный список, без добора топ-4.
-    if strict_os:
+    # 3б. При обязательной ОС (или при os_is_constraint + жёсткое условие)
+    # неподтверждённые аналоги — только в отдельный список, без добора топ-4.
+    strict_compat = strict_os or (reqs.get("os_is_constraint")
+                                  and has_hard_condition)
+    if strict_compat:
         extra: list[tuple[dict, dict]] = []
         for group in for_os + related + alternative:
             if not class_ok(group):
@@ -925,10 +951,17 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
             if not check["verified"] and not check.get("conflict"):
                 extra.append((group, check))
         collect_needs_check(extra)
+        # Неподтверждённые прямые совпадения тоже в needs_check.
+        if not strict_os:
+            collect_needs_check(direct_rejected)
 
     # 4. Если прямые не прошли проверку — вернуть их как резерв в конце.
-    # При обязательной ОС этого не делаем: неподходящими не добиваем.
-    if len(picked) < TOP4_SIZE and direct_rejected and not strict_os:
+    # При обязательной ОС или при условии совместимости с жёстким требованием
+    # (версия/архитектура/платформа) этого не делаем: неподтверждёнными
+    # не добиваем.
+    if (len(picked) < TOP4_SIZE and direct_rejected
+            and not strict_os
+            and not (reqs.get("os_is_constraint") and has_hard_condition)):
         fill(direct_rejected, ROLE_ANALOG,
              lambda g, v: ("не подтверждено: " + "; ".join(v["problems"])
                            if v["problems"] else "резерв"),
@@ -937,7 +970,8 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
     # 5. Совсем нет проверенных — показать ближайший аналог с пометкой,
     # чтобы пользователь не получил пустой топ-4. При обязательной ОС
     # аналог без подтверждения не считается результатом.
-    if not picked and alternative and not strict_os:
+    if (not picked and alternative and not strict_os
+            and not (reqs.get("os_is_constraint") and has_hard_condition)):
         loose = [(g, verify_requirements(g["best"], reqs)) for g in alternative
                  if class_ok(g)
                  and not verify_requirements(g["best"], reqs).get("conflict")]
@@ -954,6 +988,9 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
     label = compat_requirement_label(reqs)
     no_confirmed = ""
     if strict_os and not picked:
+        no_confirmed = NO_CONFIRMED_TEMPLATE.format(label=label or reqs["os"])
+    elif (reqs.get("os_is_constraint") and has_hard_condition and not picked
+          and reqs.get("os")):
         no_confirmed = NO_CONFIRMED_TEMPLATE.format(label=label or reqs["os"])
 
     shortfall = len(picked) < TOP4_SIZE
