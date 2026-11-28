@@ -107,6 +107,20 @@ def _type_label(offer_type: str | None) -> str:
     return OFFER_TYPE_LABELS.get(offer_type or "unknown", offer_type or "unknown")
 
 
+def _class_adjust(offer: dict, reqs: dict | None) -> float:
+    """Штраф артикулу другого функционального класса.
+
+    Совпадение слова, вендора, платформы или типа лицензии не доказывает
+    эквивалентность: ОС не заменяет антивирус. Артикул явно другого
+    класса получает штраф, чтобы не задавать вес всему семейству. Товары
+    без распознанного класса («unknown») не штрафуются.
+    """
+    if not reqs:
+        return 0.0
+    import product_scope
+    return -25.0 if product_scope.class_relation(offer, reqs) == "other" else 0.0
+
+
 def _type_reason(offer: dict, intent: dict) -> str:
     """Короткое «почему показан» по типу предложения."""
     otype = offer.get("offer_type") or "unknown"
@@ -356,7 +370,8 @@ def _score_group_offers(conn: sqlite3.Connection, group_key: str,
 
 
 def _pick_representative(scored: list[tuple[dict, float, dict]],
-                         intent: dict) -> tuple[dict, float, dict, float]:
+                         intent: dict,
+                         reqs: dict | None = None) -> tuple[dict, float, dict, float]:
     """Представитель группы: релевантность текста + приоритет типа.
 
     Возвращает (offer, текст_балл, детали, итоговый_балл). Именно так
@@ -365,7 +380,8 @@ def _pick_representative(scored: list[tuple[dict, float, dict]],
     """
     best: tuple[dict, float, dict, float] | None = None
     for offer, s, details in scored:
-        combined = s + _type_adjust(offer.get("offer_type"), intent)
+        combined = (s + _type_adjust(offer.get("offer_type"), intent)
+                    + _class_adjust(offer, reqs))
         if best is None or combined > best[3]:
             best = (offer, s, details, combined)
     return best
@@ -503,7 +519,7 @@ def _build_group(conn: sqlite3.Connection, key: str, query: str, q_norm: str,
     if not scored:
         return None
     best_offer, best_score, best_details, combined = _pick_representative(
-        scored, intent)
+        scored, intent, reqs)
     variants = []
     for offer, s, _ in scored[:variants_limit]:
         variants.append({
@@ -816,7 +832,19 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
     # reqs нужен для отбраковки SKU до выбора представителя группы.
     if reqs is None:
         from selection import extract_requirements
-        reqs = extract_requirements(q_norm or effective_query)
+        reqs = extract_requirements(q_norm or effective_query, conn)
+    else:
+        # Даже переданные условия дополняем классом продукта: запрос мог
+        # уточниться между репликами («Касперски» → «… для линукс»).
+        import product_scope
+        reqs = product_scope.refine_requirements(conn, reqs, effective_query)
+
+    # «ОС с поддержкой» — составная потребность: покупают лицензию, а
+    # поддержку как компонент. Намерение «сопровождение» ставило бы услуги
+    # выше самих лицензий, поэтому здесь оно не главное.
+    if (intent["name"] == "support" and reqs.get("support_component")
+            and (reqs.get("product_is_os") or reqs.get("product_classes"))):
+        intent = {"name": "general", "primary": _INTENT_PRIMARY["general"]}
 
     ids = _candidate_ids(conn, q_tokens)
     offers = _load_offers(conn, ids)
@@ -846,7 +874,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10,
         s, details = score_offer(effective_query, q_norm, q_tokens, q_versions,
                                  offer)
         score_cache[offer["id"]] = (s, details)
-        combined = s + _type_adjust(offer.get("offer_type"), intent)
+        combined = (s + _type_adjust(offer.get("offer_type"), intent)
+                    + _class_adjust(offer, reqs))
         key = _group_key(offer)
         cur = best_by_group.get(key)
         if cur is None or s > cur[1] or (s == cur[1] and combined > cur[3]):

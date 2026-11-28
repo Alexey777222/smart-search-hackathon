@@ -43,7 +43,10 @@ def run(conn: sqlite3.Connection) -> dict:
         },
         "астра линукс": {
             "expect": {
-                "count": 4, "first_family": "astra",
+                # 3, а не 4: четвёртой позицией было средство восстановления
+                # Granulex (не операционная система) — теперь оно отбраковано
+                # как другой функциональный класс.
+                "count_ge": 3, "first_family": "astra",
                 "first_available": True, "first_price": True,
             },
         },

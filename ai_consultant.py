@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 import httpx
 
 import organizer_search as osr
+import product_scope
 from organizer_index import (OFFER_TYPE_LABELS, STOPWORDS, connect, get_offer,
                              get_meta, normalize_text, query_tokens, tokenize)
 from selection import COMPAT_RULES, build_top4, extract_requirements
@@ -269,6 +270,12 @@ class Session:
     cards: list[dict] = field(default_factory=list)
     usage: dict = field(default_factory=lambda: {"prompt": 0, "completion": 0})
     created: float = field(default_factory=time.time)
+    # Последний поисковый запрос и его топ-4: уточняющие вопросы
+    # (лицензия, дополнения, стоимость…) отвечают по уже найденному,
+    # а не запускают тот же поиск заново.
+    last_query: str = ""
+    last_top4: dict | None = None
+    question_type: str = ""
 
     def context_summary(self) -> dict:
         return {"intent": self.intent,
@@ -374,15 +381,106 @@ def _clean_model_requirements(raw) -> dict:
     return out
 
 
-def _merge_requirements(server: dict, model: dict, previous: dict | None) -> dict:
+# ── тип вопроса и граница задачи ──────────────────────────────────
+#
+# Покупатель задаёт разные вопросы об одном и том же товаре. Для них
+# нужен разный ответ, а не одинаковый повторный поиск:
+#   select     — подберите товар;
+#   compat     — совместимо ли;
+#   unsuitable — что не подойдёт и почему;
+#   license    — какую лицензию брать;
+#   extras     — что ещё потребуется;
+#   compare    — сравнить варианты;
+#   cost       — во сколько обойдётся.
+#
+# Уточняющие вопросы отвечают по уже найденному набору (last_top4), без
+# повторного запуска того же поиска.
+
+_QUESTION_TYPES = (
+    ("unsuitable", re.compile(
+        r"не\s+подойд|неподход|не\s+подход|что\s+не\s+подойд|"
+        r"каки\w*\s+.*\bне\s+(?:подойд|подход)|исключ|почему\s+не\s+подойд|"
+        r"причин\w*\s+исключ", re.I)),
+    ("license", re.compile(
+        r"как\w*\s+лицензи|какую\s+лицензи|тип\s+лицензи|"
+        r"выбрать\s+лицензи|лицензи\w*\s+(?:выбрать|брать|нужн)|"
+        r"какая\s+лицензи", re.I)),
+    ("extras", re.compile(
+        r"что\s+ещё|что\s+еще|дополнительн|дополнени|что\s+потребу|"
+        r"что\s+нужно\s+(?:ещё|еще)|докупить|сопутств", re.I)),
+    ("compare", re.compile(
+        r"сравн|разниц|чем\s+отлич|что\s+лучше|что\s+выбрать|"
+        r"какой\s+лучше", re.I)),
+    ("cost", re.compile(
+        r"во\s+сколько|сколько\s+стои|стоимост|обойд|цена\s+решени|"
+        r"итогов\w*\s+стои|расчёт|расчет|бюджет|сколько\s+будет", re.I)),
+    ("compat", re.compile(
+        r"совместим|подойдёт\s+ли|подойдет\s+ли|подходит\s+ли|"
+        r"работает\s+ли|поддержива", re.I)),
+)
+
+# Типы вопросов, которые отвечают по уже найденному набору.
+FOLLOWUP_TYPES = {"unsuitable", "license", "extras", "compare", "cost"}
+
+
+def classify_question(text: str) -> str:
+    """Тип вопроса покупателя (select по умолчанию)."""
+    low = normalize_text(text or "")
+    for name, pattern in _QUESTION_TYPES:
+        if pattern.search(low):
+            return name
+    return "select"
+
+
+# Явные признаки новой независимой задачи в той же сессии.
+_NEW_TASK_RE = re.compile(
+    r"а\s+теперь|теперь\s+(?:мне\s+)?(?:нужн|надо|подбери|ищи)|"
+    r"друг\w*\s+(?:задач|продукт|вопрос)|нов\w*\s+(?:задач|вопрос)|"
+    r"переключ|следующ\w*\s+(?:задач|вопрос)|ещё\s+одн\w*\s+задач", re.I)
+# Короткие ответы на уточняющий вопрос — это продолжение, а не новая задача.
+# Названий продуктов здесь нет: короткая реплика покрыта общим правилом
+# (три слова и меньше).
+_CONTINUATION_RE = re.compile(
+    r"^(?:весь|всего|отдельн|файл|каталог|образ|полн|системн|"
+    r"да|нет|пожалуйста|нужн|конечно|верно)", re.I)
+
+
+def _is_new_task(message: str, prev_classes, cur_classes,
+                 prev_query: str = "") -> bool:
+    """Новая независимая задача или продолжение текущей."""
+    text = (message or "").strip()
+    if _NEW_TASK_RE.search(text):
+        return True
+    if _CONTINUATION_RE.search(text) or len(text.split()) <= 3:
+        return False
+    # Общие слова с прошлым запросом — это продолжение той же задачи
+    # («сервер» → «резервное копирование сервера»).
+    if prev_query:
+        try:
+            if set(query_tokens(message)) & set(query_tokens(prev_query)):
+                return False
+        except Exception:
+            pass
+    prev, cur = set(prev_classes or []), set(cur_classes or [])
+    return bool(prev) and bool(cur) and prev.isdisjoint(cur)
+
+
+def _merge_requirements(server: dict, model: dict, previous: dict | None,
+                        new_task: bool = False) -> dict:
     """Объединяет локальные, модельные и унаследованные условия.
 
     Локальные (regex) условия приоритетнее модельных. Версии из прошлой
     реплики переносятся только для той же ОС — так «Astra Linux 1.7»
-    не теряется при уточнении задачи. Роль, объём восстановления и факт
-    «сервер уже есть» сохраняются в сессии: они не зависят от формулировки
-    текущего сообщения, если пользователь не поменял задачу.
+    не теряется при уточнении задачи.
+
+    Роль, объём восстановления, «сервер уже есть» и версия ALD переносятся
+    из прошлой реплики, ТОЛЬКО если это продолжение той же задачи. При
+    новой независимой задаче (`new_task=True`) унаследованные ограничения
+    сбрасываются: иначе антивирус после бэкапа получит чужую ОС, версию,
+    тип лицензии и объём восстановления.
     """
+    if new_task:
+        previous = {}
     previous = previous or {}
     reqs = {
         "os": (server.get("os") or model.get("os")
@@ -1040,6 +1138,23 @@ class Consultant:
         """Один вызов модели: разбор запроса + локальная подборка товаров."""
         server_reqs = extract_requirements(message)
         previous = dict(session.requirements or {})
+        conn = self.catalog.conn
+        question_type = classify_question(message)
+        session.question_type = question_type
+
+        # Уточняющий вопрос по уже найденному набору: не запускаем тот же
+        # поиск заново, а отвечаем по прошлому топ-4 (лицензия, дополнения,
+        # сравнение, стоимость, что не подойдёт).
+        if (question_type in FOLLOWUP_TYPES and session.last_top4
+                and session.last_query and session.requirements):
+            return self._answer_from_session(session, message, question_type,
+                                             started)
+
+        scope = product_scope.resolve(conn, message)
+        cur_classes = scope.get("product_classes") or []
+        new_task = _is_new_task(message,
+                                previous.get("product_classes") or [],
+                                cur_classes, session.last_query)
 
         extracted: dict = {}
         used_model = False
@@ -1073,7 +1188,26 @@ class Consultant:
 
         reqs = _merge_requirements(server_reqs,
                                    extracted.get("requirements") or {},
-                                   previous)
+                                   previous, new_task=new_task)
+        # Класс продукта сохраняем в сессии, чтобы следующая реплика
+        # понимала, о какой задаче речь. При новой задаче он берётся из
+        # текущей реплики, при продолжении — из уже накопленных условий.
+        if cur_classes or new_task or question_type == "select":
+            reqs = product_scope.refine_requirements(conn, reqs, message)
+            # Короткое уточнение той же задачи («объекты каталога») не
+            # называет класс словами — он остаётся тем, что уже назван.
+            if not cur_classes and not new_task and not reqs.get("product_classes"):
+                reqs["product_classes"] = previous.get("product_classes") or []
+                reqs["product_is_os"] = previous.get("product_is_os", False)
+                reqs["os_is_constraint"] = previous.get("os_is_constraint",
+                                                        False)
+        else:
+            reqs.setdefault("product_classes",
+                            previous.get("product_classes") or [])
+            reqs.setdefault("product_is_os",
+                            previous.get("product_is_os", False))
+            reqs.setdefault("os_is_constraint",
+                            previous.get("os_is_constraint", False))
 
         # Один уточняющий вопрос: задача — восстановление, а объект не назван.
         # ОС, версия и «сервер уже есть» уже лежат в reqs и сохраняются в
@@ -1181,13 +1315,16 @@ class Consultant:
 
         answer = _compose_answer(query, top4, reqs, used_model, fallback_reason,
                                  self.provider.name,
-                                 getattr(self.provider, "model", ""))
+                                 getattr(self.provider, "model", ""),
+                                 question_type)
 
         session.intent = result["intent"]["name"]
         session.requirements = reqs
         if cards:
             session.product = cards[0]
         session.cards = cards
+        session.last_query = query
+        session.last_top4 = top4
         session.messages.append({"role": "assistant", "content": answer})
 
         elapsed = round((time.perf_counter() - started) * 1000)
@@ -1217,7 +1354,7 @@ class Consultant:
             "requirements": {key: reqs.get(key) for key in
                              ("os", "version", "arch", "license_type",
                               "wants_os", "role", "restore_scope",
-                              "server_owned")},
+                              "server_owned", "product_classes")},
             "verified_count": top4.get("verified_count", len(confirmed)),
             "needs_check_count": len(needs_check),
             "no_confirmed_message": top4.get("no_confirmed_message") or "",
@@ -1227,6 +1364,65 @@ class Consultant:
             "api_usage": api_usage,
             "cost": cost,
             "cost_rub": cost["amount_rub"] if cost else None,
+            "question_type": question_type,
+            "diagnostics": _diagnostics(self.provider.name, model_name,
+                                        used_model, calls, elapsed,
+                                        dict(session.usage), api_usage),
+        }
+
+    def _answer_from_session(self, session: Session, message: str,
+                             question_type: str, started: float) -> dict:
+        """Ответ на уточняющий вопрос по уже найденному набору.
+
+        Повторный поиск не запускается: тип вопроса меняет только
+        формулировку ответа (лицензия, дополнения, сравнение, стоимость,
+        что не подойдёт), а товары берутся из прошлого топ-4.
+        """
+        reqs = dict(session.requirements or {})
+        top4 = session.last_top4 or {"items": [], "needs_check": [],
+                                     "verified_count": 0,
+                                     "requirements": {}}
+        answer = _compose_answer(session.last_query, top4, reqs, False, "",
+                                 self.provider.name,
+                                 getattr(self.provider, "model", ""),
+                                 question_type)
+        cards = (top4.get("items") or []) + (top4.get("needs_check") or [])
+        session.messages.append({"role": "assistant", "content": answer})
+        session.question_type = question_type
+        elapsed = round((time.perf_counter() - started) * 1000)
+        model_name = getattr(self.provider, "model", "")
+        return {
+            "answer": answer,
+            "cards": cards,
+            "top4": top4,
+            "clarification": False,
+            "provider": self.provider.name,
+            "model": model_name,
+            "live": False,
+            "used_model": False,
+            "fallback_reason": "",
+            "session": session.id,
+            "context": session.context_summary(),
+            "query": session.last_query,
+            "requirements": {key: reqs.get(key) for key in
+                             ("os", "version", "arch", "license_type",
+                              "wants_os", "role", "restore_scope",
+                              "server_owned", "product_classes")},
+            "verified_count": top4.get("verified_count",
+                                       len(top4.get("items") or [])),
+            "needs_check_count": len(top4.get("needs_check") or []),
+            "no_confirmed_message": top4.get("no_confirmed_message") or "",
+            "calls": 0,
+            "latency_ms": elapsed,
+            "usage": dict(session.usage),
+            "api_usage": {},
+            "cost": None,
+            "cost_rub": None,
+            "question_type": question_type,
+            "followup": True,
+            "diagnostics": _diagnostics(self.provider.name, model_name,
+                                        False, 0, elapsed,
+                                        dict(session.usage), {}),
         }
 
     def _ask_tools(self, session: Session, message: str,
@@ -1320,30 +1516,76 @@ class Consultant:
 
 def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
                     fallback_reason: str, provider_name: str,
-                    model: str) -> str:
-    """Текст ответа без домыслов модели: факты только из индекса и правил."""
+                    model: str,
+                    question_type: str = "select") -> str:
+    """Текст ответа без домыслов модели: факты только из индекса и правил.
+
+    Начинает с полезного покупателю ответа; техническая информация о модели,
+    токенах и времени работы передаётся отдельно в поле `diagnostics`.
+    """
     items = top4.get("items") or []
     needs_check = top4.get("needs_check") or []
-    lines: list[str] = []
-    if used_model:
-        lines.append(
-            f"Модель {model or provider_name} выделила запрос «{query}» и "
-            f"обязательные условия; товары, цены и наличие взяты из "
-            f"локального индекса каталога.")
-    else:
-        lines.append("Ответ получен без модели: показана локальная подборка "
-                     "по индексу каталога.")
-        if fallback_reason:
-            lines.append(f"Причина: {fallback_reason}.")
+    no_confirmed = top4.get("no_confirmed_message") or ""
+    shortfall = top4.get("shortfall") or False
+    shortfall_reason = top4.get("shortfall_reason") or ""
+    summary = ((top4.get("requirements") or {}).get("summary") or "")
 
-    summary = (top4.get("requirements") or {}).get("summary") or ""
+    lines: list[str] = []
+
+    # ── ответ покупателю (по типу вопроса) ──────────────────────
+    if question_type == "cost":
+        lines.extend(_cost_breakdown(items))
+    elif question_type == "unsuitable":
+        lines.extend(_unsuitable_answer(top4, needs_check, items))
+    elif question_type == "license":
+        lines.extend(_license_answer(items))
+    elif question_type == "extras":
+        lines.extend(_extras_answer(items, needs_check))
+    elif question_type == "compare":
+        lines.extend(_compare_answer(items))
+    elif question_type == "compat":
+        lines.extend(_compat_answer(items, needs_check, no_confirmed, summary))
+    else:
+        lines.extend(_default_answer(query, top4, items, needs_check,
+                                     no_confirmed, summary, shortfall,
+                                     shortfall_reason))
+
+    if not used_model:
+        lines.append("(Ответ сформирован локально, без модели: показана "
+                     "подборка по индексу каталога.)")
+
+    return "\n".join(line for line in lines if line)
+
+
+def _diagnostics(provider_name: str, model: str, used_model: bool, calls: int,
+                 elapsed_ms: int, usage: dict, api_usage: dict) -> dict:
+    """Технические сведения отдельно от ответа покупателю."""
+    return {
+        "provider": provider_name,
+        "model": model,
+        "used_model": bool(used_model),
+        "calls": int(calls),
+        "latency_ms": int(elapsed_ms),
+        "tokens": {
+            "prompt": int((usage or {}).get("prompt") or 0),
+            "completion": int((usage or {}).get("completion") or 0),
+            "total": int((usage or {}).get("prompt") or 0)
+            + int((usage or {}).get("completion") or 0),
+        },
+        "api_total_tokens": int((api_usage or {}).get("total_tokens") or 0),
+    }
+
+
+# ── блоки ответа по типу вопроса ────────────────────────────────
+
+def _default_answer(query: str, top4: dict, items: list, needs_check: list,
+                    no_confirmed: str, summary: str,
+                    shortfall: bool, shortfall_reason: str) -> list[str]:
+    lines: list[str] = []
     if summary:
         lines.append(f"Обязательные условия: {summary}.")
-
-    no_confirmed = top4.get("no_confirmed_message") or ""
     if no_confirmed:
         lines.append(no_confirmed + ".")
-
     if items:
         lines.append(f"Подтверждённых результатов: {len(items)}.")
         for index, item in enumerate(items, 1):
@@ -1359,7 +1601,6 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
                 lines.append(f"   Не подтверждено: {'; '.join(item['problems'])}.")
     elif not no_confirmed:
         lines.append(f"По запросу «{query}» в каталоге ничего не нашлось.")
-
     if needs_check:
         note = top4.get("needs_check_note") or "Совместимость требует проверки"
         lines.append(f"{note} (в подтверждённые результаты не входят):")
@@ -1371,10 +1612,150 @@ def _compose_answer(query: str, top4: dict, reqs: dict, used_model: bool,
                 lines.append(f"   Ограничение: {item['limitation']}.")
             if item.get("problems"):
                 lines.append(f"   Причина: {'; '.join(item['problems'])}.")
-
-    if top4.get("shortfall") and items:
-        lines.append(top4.get("shortfall_reason") or "")
+    if shortfall and items:
+        lines.append(shortfall_reason)
     if top4.get("reserve_note"):
         lines.append(top4["reserve_note"])
-    return "\n".join(line for line in lines if line)
+    return lines
+
+
+def _cost_breakdown(items: list) -> list[str]:
+    """Расчёт стоимости: обязательные компоненты + необязательные."""
+    lines: list[str] = []
+    if not items:
+        lines.append("Нет подтверждённых товаров для расчёта.")
+        return lines
+    mandatory = [it for it in items if it.get("role") == "прямое совпадение"]
+    optional = [it for it in items if it.get("role") != "прямое совпадение"]
+    total = 0
+    missing = []
+    if mandatory:
+        lines.append("Обязательные компоненты (прямое совпадение):")
+        for it in mandatory:
+            price = it.get("price") or 0
+            period = it.get("duration") or ""
+            if price > 0:
+                total += price
+                period_text = f" ({period})" if period else ""
+                lines.append(f"- {it['name']}: {it['price_text']} за 1 шт.{period_text}")
+            else:
+                missing.append(it["name"])
+        lines.append(f"Итого за обязательные компоненты: {total:,.0f} ₽".replace(",", " "))
+        if missing:
+            lines.append(f"Цены по следующим позициям не указаны: {', '.join(missing)} — уточните количество и период.")
+    if optional:
+        lines.append("Дополнительные (необязательные):")
+        for it in optional:
+            price = it.get("price") or 0
+            period = it.get("duration") or ""
+            if price > 0:
+                period_text = f" ({period})" if period else ""
+                lines.append(f"- {it['name']}: {it['price_text']} за 1 шт.{period_text}")
+            else:
+                lines.append(f"- {it['name']}: цена не указана")
+    return lines
+
+
+def _unsuitable_answer(top4: dict, needs_check: list, items: list) -> list[str]:
+    """Что не подойдёт и почему."""
+    lines: list[str] = []
+    rejected = top4.get("rejected") or []
+    if not items and not needs_check and not rejected:
+        lines.append("Нет товаров для анализа совместимости.")
+        return lines
+    if items:
+        lines.append("Подходящие варианты:")
+        for it in items:
+            lines.append(f"- {it['name']}: {it['type_label']}, {it['price_text']}")
+    if rejected:
+        lines.append("Не подходят:")
+        for it in rejected:
+            problems = "; ".join(it.get("problems") or [])
+            lines.append(f"- {it['name']}: {problems or 'не подходит'}")
+    if needs_check:
+        lines.append("Требуют проверки:")
+        for it in needs_check:
+            problems = "; ".join(it.get("problems") or [])
+            lines.append(f"- {it['name']}: {problems or 'совместимость не подтверждена'}")
+    return lines
+
+
+def _license_answer(items: list) -> list[str]:
+    """Какую лицензию выбрать."""
+    lines: list[str] = []
+    if not items:
+        lines.append("Нет товаров для анализа.")
+        return lines
+    base = [it for it in items if it.get("offer_type") in ("base", "subscription")]
+    support = [it for it in items if it.get("offer_type") == "support"]
+    renewal = [it for it in items if it.get("offer_type") == "renewal"]
+    if base:
+        lines.append("Базовая лицензия или подписка (новая покупка):")
+        for it in base:
+            lines.append(f"- {it['name']}: {it['type_label']}, {it['price_text']}")
+    if renewal:
+        lines.append("Продление (нужно, если лицензия уже есть):")
+        for it in renewal:
+            lines.append(f"- {it['name']}: {it['type_label']}, {it['price_text']}")
+    if support:
+        lines.append("Сопровождение/техподдержка:")
+        for it in support:
+            lines.append(f"- {it['name']}: {it['type_label']}, {it['price_text']}")
+    return lines
+
+
+def _extras_answer(items: list, needs_check: list) -> list[str]:
+    """Что ещё потребуется."""
+    lines: list[str] = []
+    if not items:
+        lines.append("Нет подтверждённых товаров для подбора дополнений.")
+        return lines
+    related = [it for it in items if it.get("role") == "сопутствующий товар"]
+    if related:
+        lines.append("Сопутствующие товары:")
+        for it in related:
+            lines.append(f"- {it['name']}: {it['type_label']}, {it['price_text']}")
+    if needs_check:
+        lines.append("Требуют проверки:")
+        for it in needs_check:
+            lines.append(f"- {it['name']}: {', '.join(it.get('problems') or ['совместимость не подтверждена'])}")
+    return lines
+
+
+def _compare_answer(items: list) -> list[str]:
+    """Сравнение вариантов."""
+    lines: list[str] = []
+    if not items:
+        lines.append("Нет товаров для сравнения.")
+        return lines
+    lines.append("Сравнение вариантов:")
+    for index, it in enumerate(items, 1):
+        vendor = it.get("vendor") or "—"
+        platform = it.get("platform") or "—"
+        duration = it.get("duration") or "—"
+        lines.append(
+            f"{index}. {it['name']} ({vendor}) — {it['price_text']}, "
+            f"тип: {it['type_label']}, платформа: {platform}, "
+            f"период: {duration}")
+    return lines
+
+
+def _compat_answer(items: list, needs_check: list,
+                   no_confirmed: str, summary: str) -> list[str]:
+    """Совместимость: что совместимо, что нет."""
+    lines: list[str] = []
+    if summary:
+        lines.append(f"Проверяем совместимость с: {summary}.")
+    if items:
+        lines.append(f"Совместимые ({len(items)}):")
+        for it in items:
+            facts = "; ".join(it.get("facts") or [])
+            lines.append(f"- {it['name']}: {facts}")
+    if needs_check:
+        lines.append(f"Требуют проверки ({len(needs_check)}):")
+        for it in needs_check:
+            lines.append(f"- {it['name']}: {'; '.join(it.get('problems') or ['совместимость не подтверждена'])}")
+    if no_confirmed:
+        lines.append(no_confirmed)
+    return lines
 

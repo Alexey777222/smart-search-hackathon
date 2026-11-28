@@ -24,6 +24,7 @@ import json
 import re
 
 import organizer_search as osr
+import product_scope
 import sku_rules
 from organizer_index import OFFER_TYPE_LABELS, normalize_text
 
@@ -146,12 +147,17 @@ _SERVER_OWNED = re.compile(
 
 # ── извлечение обязательных условий из запроса ────────────────────
 
-def extract_requirements(query: str) -> dict:
+def extract_requirements(query: str, conn=None) -> dict:
     """Что пользователь потребовал явно: ОС, версия, архитектура, тип лицензии.
 
     Отрицание («без windows», «не windows») снимает условие и превращается
     в исключение: такие платформы не должны попадать в проверенные
     допродажи.
+
+    Если передан `conn`, условия дополняются классом продукта
+    (`product_scope`): «Касперски для линукс» — это антивирус с условием
+    Linux, а не запрос про операционную систему. `wants_os` в этом случае
+    пересчитывается по фактическому классу продукта.
     """
     text = normalize_text(query)
     exclude = set(_NEGATION_RE.findall(text))
@@ -224,6 +230,12 @@ def extract_requirements(query: str) -> dict:
 
     # Сервер уже куплен — железо не предлагаем.
     reqs["server_owned"] = bool(_SERVER_OWNED.search(positive))
+
+    # Класс продукта и роль ОС: обобщённо, по таксономии каталога.
+    # Только при наличии соединения — оно нужно, чтобы сопоставить бренд
+    # с категориями его товаров.
+    if conn is not None:
+        reqs = product_scope.refine_requirements(conn, reqs, query)
 
     return reqs
 
@@ -330,6 +342,16 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
                 return {"verified": False, "facts": facts,
                         "problems": problems, "conflict": True, "rule": rule}
 
+    # 0а. Функциональный класс: операционная система не может быть
+    # аналогом антивируса, средства резервного копирования и любого
+    # другого не-ОС класса — даже при совпадении слова, вендора, платформы
+    # или типа лицензии. Правило общее, из таксономии `product_scope`.
+    scope_reason = product_scope.functional_conflict(offer, reqs or {})
+    if scope_reason:
+        problems.append(scope_reason)
+        return {"verified": False, "facts": facts, "problems": problems,
+                "conflict": True, "rule": rule}
+
     # 0б. Ограничения конкретного артикула: ОС в названии, назначение
     # (сервер / рабочая станция), объект восстановления. Проверяются до
     # группировки в семейства: «Кибер Бэкап …, для рабочей станции Windows»
@@ -428,11 +450,15 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
             return {"verified": False, "facts": facts, "problems": problems,
                     "conflict": False, "rule": rule}
 
-    # 5. Намерение «купить ОС»: кандидат должен быть ОС.
+    # 5. Намерение «купить ОС»: кандидат должен быть ОС, но сопровождение,
+    # продление и дополнение — сопутствующие услуги к ОС, они допустимы
+    # (например, «российская ОС … с возможностью технической поддержки»).
     if reqs and reqs.get("wants_os") and not rule and not is_os_offer(offer):
-        problems.append("запрос про операционную систему, а SKU — не ОС")
-        return {"verified": False, "facts": facts, "problems": problems,
-                "conflict": False, "rule": rule}
+        otype = offer.get("offer_type") or "unknown"
+        if otype not in ("support", "addon", "renewal"):
+            problems.append("запрос про операционную систему, а SKU — не ОС")
+            return {"verified": False, "facts": facts, "problems": problems,
+                    "conflict": False, "rule": rule}
 
     return {"verified": True, "facts": facts, "problems": problems,
             "conflict": False, "rule": rule}
@@ -449,6 +475,10 @@ def _requirement_summary(reqs: dict) -> str:
     if reqs.get("license_type"):
         parts.append(OFFER_TYPE_LABELS.get(reqs["license_type"],
                                           reqs["license_type"]))
+    if reqs.get("needs_support"):
+        parts.append("нужна техническая поддержка")
+    if reqs.get("product_classes"):
+        parts.append("класс: " + ", ".join(reqs["product_classes"]))
     if reqs.get("role") == "server":
         parts.append("серверная лицензия")
     elif reqs.get("role") == "workstation":
@@ -641,8 +671,41 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         # Обязательные условия ищем по исправленному запросу: «astra linuc»
         # уже нормализован до «astra linux» в поле normalized.
         reqs = extract_requirements(result.get("normalized") or query)
+    else:
+        # Условия из поиска уже содержат класс продукта (`product_scope`).
+        # Если вызывающий передал их без него, добираем из результата.
+        reqs = dict(reqs)
+        res_reqs = result.get("requirements") or {}
+        for key in ("product_classes", "product_is_os", "os_is_constraint",
+                    "scope_brand"):
+            if key not in reqs and key in res_reqs:
+                reqs[key] = res_reqs[key]
 
-    strict_os = bool(reqs.get("os"))
+    wanted = product_scope.wanted_classes(reqs)
+
+    def class_ok(group: dict, strict: bool = False) -> bool:
+        """Артикул другого функционального класса не считается результатом.
+
+        Функциональная релевантность — это класс продукта, а не отдельное
+        совпавшее слово. ОС не заменяет антивирус, средство резервного
+        копирования — антивирус и т.п. `class_relation` учитывает неточную
+        категорию: название артикула важнее категории (Granulex Recovery в
+        категории ОС — это средство восстановления).
+
+        `strict` — для ролей «прямое совпадение» и «функциональный аналог»:
+        там нужна подтверждённая принадлежность классу (`same`). Позиции с
+        нераспознанным классом (`unknown`) не получают эти роли, но могут
+        остаться сопутствующими.
+        """
+        if not wanted:
+            return True
+        relation = product_scope.class_relation(group["best"], reqs)
+        return relation == "same" if strict else relation != "other"
+
+    # Обязательная ОС как условие совместимости («резервное копирование на
+    # Astra Linux») не превращает запрос в запрос про операционную систему:
+    # требовать от кандидата быть ОС нельзя, иначе подборка пуста.
+    strict_os = bool(reqs.get("os")) and not reqs.get("os_is_constraint")
     direct = [g for g in groups if g["bucket"] == "direct"]
     for_os = [g for g in groups if g["bucket"] == "for_os"]
     related = [g for g in groups if g["bucket"] == "related"]
@@ -756,8 +819,9 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
             entry["_family"] = family_id(group["best"])
             needs_check.append(entry)
 
-    # 1. Прямые совпадения.
-    direct_pool = [(g, verify_requirements(g["best"], reqs)) for g in direct]
+    # 1. Прямые совпадения — только подтверждённого запрошенного класса.
+    direct_pool = [(g, verify_requirements(g["best"], reqs)) for g in direct
+                   if class_ok(g, strict=True)]
     has_hard_condition = bool(reqs.get("os") or reqs.get("version")
                               or reqs.get("arch") or reqs.get("license_type")
                               or (reqs.get("wants_os") and not reqs.get("os")))
@@ -778,7 +842,8 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
 
     # 2. Проверенные сопутствующие товары (товары для ОС и related).
     if len(picked) < TOP4_SIZE:
-        related_pool = _verified_candidates(for_os + related, reqs)
+        related_pool = _verified_candidates(
+            [g for g in for_os + related if class_ok(g)], reqs)
         fill(related_pool, ROLE_RELATED,
              lambda g, v: "; ".join(v["facts"]) or g.get("reason") or "",
              TOP4_SIZE - len(picked))
@@ -807,7 +872,8 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
             return ("точного товара нет — аналог: "
                     + (group.get("reason") or "другая линейка"))
 
-        analog_pool = _verified_candidates(alternative, reqs)
+        analog_pool = _verified_candidates(
+            [g for g in alternative if class_ok(g, strict=True)], reqs)
         fill(analog_pool, analog_role, analog_reason,
              TOP4_SIZE - len(picked))
 
@@ -816,6 +882,8 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
     if strict_os:
         extra: list[tuple[dict, dict]] = []
         for group in for_os + related + alternative:
+            if not class_ok(group):
+                continue
             if any(id(group) == id(g) for g, _ in direct_rejected):
                 continue
             check = verify_requirements(group["best"], reqs)
@@ -836,7 +904,8 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
     # аналог без подтверждения не считается результатом.
     if not picked and alternative and not strict_os:
         loose = [(g, verify_requirements(g["best"], reqs)) for g in alternative
-                 if not verify_requirements(g["best"], reqs).get("conflict")]
+                 if class_ok(g)
+                 and not verify_requirements(g["best"], reqs).get("conflict")]
         fill(loose, ROLE_ANALOG,
              lambda g, v: ("не подтверждено: " + "; ".join(v["problems"])
                            if v["problems"] else "резерв"),
@@ -865,6 +934,24 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
     for item in needs_check:
         item.pop("_family", None)
 
+    # Явно неподходящие товары с причинами — для вопроса «что не подойдёт».
+    rejected: list[dict] = []
+    seen_rejected: set[str] = set()
+    for group, verification in direct_pool:
+        if verification.get("verified"):
+            continue
+        fam = family_id(group["best"])
+        if fam in seen_rejected:
+            continue
+        seen_rejected.add(fam)
+        entry = _entry(group, ROLE_ANALOG,
+                       "; ".join(verification.get("problems") or [])
+                       or "не подходит", verification)
+        entry["rejected"] = True
+        rejected.append(entry)
+        if len(rejected) >= 6:
+            break
+
     return {
         "items": picked,
         "count": len(picked),
@@ -873,6 +960,7 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         "strict_os": strict_os,
         "needs_check": needs_check,
         "needs_check_note": NEEDS_CHECK_NOTE if needs_check else "",
+        "rejected": rejected,
         "no_confirmed_message": no_confirmed,
         "shortfall": shortfall,
         "shortfall_reason": no_confirmed or reason,
@@ -884,6 +972,10 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
             "arch": reqs.get("arch"),
             "license_type": reqs.get("license_type"),
             "wants_os": reqs.get("wants_os", False),
+            "product_classes": reqs.get("product_classes") or [],
+            "product_is_os": reqs.get("product_is_os", False),
+            "os_is_constraint": reqs.get("os_is_constraint", False),
+            "needs_support": reqs.get("needs_support", False),
             "summary": _requirement_summary(reqs),
         },
         "candidate_pools": {
