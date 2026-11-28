@@ -105,36 +105,41 @@ def field_platforms(offer: dict) -> set[str]:
 
 
 def platform_conflict(offer: dict, reqs: dict) -> str:
-    """Артикул явно ограничен другой платформой, чем обязательная ОС.
+    """Артикул явно ограничен другой платформой, чем требует покупатель.
 
     Сначала проверяется название: «…, для рабочей станции Windows» —
     однозначное ограничение артикула, даже если общее поле платформы
     широкое (`Linux/Windows`). Затем — само поле `platform`.
+
+    Требование берётся из опознанной ОС (`os_rule_obj`) либо из
+    платформенного семейства запроса (`platform_family` — «антивирус для
+    Windows», «… для Linux»): смешанная или пустая платформа конфликтом не
+    считается, это неизвестная характеристика.
     """
-    rule = (reqs or {}).get("os_rule_obj")
-    if not rule or rule.get("kind") != "os":
-        return ""
-    want = rule.get("platform_family")
+    reqs = reqs or {}
+    rule = reqs.get("os_rule_obj")
+    if rule and rule.get("kind") == "os":
+        want = rule.get("platform_family")
+        product = rule.get("product", "обязательная ОС")
+    else:
+        want = reqs.get("platform_family")
+        product = {"windows": "Windows", "linux": "Linux"}.get(want or "", "")
     if not want:
         return ""
-    product = rule.get("product", "обязательная ОС")
 
     by_name = name_platforms(offer)
     if by_name:
         # Название артикула уже называет платформу — она важнее общего
         # поля `platform`, которое бывает широким или устаревшим.
-        if by_name == {"windows"} and want == "linux":
-            return (f"в названии артикула указана только Windows, а требуется "
-                    f"«{product}»")
-        if by_name == {"linux"} and want == "windows":
-            return (f"в названии артикула указан только Linux, а требуется "
-                    f"«{product}»")
+        if want not in by_name:
+            return (f"в названии артикула указана платформа "
+                    f"{'/'.join(sorted(by_name))}, а требуется «{product}»")
         return ""
 
     by_field = field_platforms(offer)
-    if by_field and by_field == {"windows"} and want == "linux":
-        return (f"платформа артикула — только Windows, а требуется "
-                f"«{product}»")
+    if by_field and want not in by_field:
+        return (f"платформа артикула — {'/'.join(sorted(by_field))}, а "
+                f"требуется «{product}»")
     return ""
 
 

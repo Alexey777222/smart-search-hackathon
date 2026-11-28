@@ -231,6 +231,26 @@ def extract_requirements(query: str, conn=None) -> dict:
     # Сервер уже куплен — железо не предлагаем.
     reqs["server_owned"] = bool(_SERVER_OWNED.search(positive))
 
+    # Платформенное семейство из запроса: «для Windows», «для Linux»,
+    # «под Astra Linux» и т.п. — извлекается независимо от COMPAT_RULES.
+    # Когда покупатель называет ОС как условие совместимости (`os_is_constraint`),
+    # это семейство становится требованием к платформе SKU.
+    _QUERY_PLATFORMS = {
+        "windows": _WINDOWS_WORDS,
+        "linux": {"linux", "линукс", "астра", "astra", "редос", "альт",
+                  "centos", "debian", "ubuntu", "rhel", "suse", "рос", "unix"},
+    }
+    reqs["platform_family"] = None
+    for family, words in _QUERY_PLATFORMS.items():
+        if any(w in positive for w in words):
+            reqs["platform_family"] = family
+            break
+
+    # Требование к платформе ставит `product_scope`: нужен индекс, чтобы
+    # отличить «ОС — сам продукт» от «ОС — условие совместимости».
+    if conn is None:
+        reqs["platform_family"] = None
+
     # Класс продукта и роль ОС: обобщённо, по таксономии каталога.
     # Только при наличии соединения — оно нужно, чтобы сопоставить бренд
     # с категориями его товаров.
@@ -294,17 +314,14 @@ def is_os_offer(offer: dict) -> bool:
 
 
 def platform_conflict(offer: dict, reqs: dict) -> str:
-    """Явный конфликт платформы конкретного артикула с обязательной ОС.
+    """Явный конфликт платформы артикула с требованием покупателя.
 
-    Проверяется название артикула, затем общее поле `platform`: смешанная
-    платформа («Linux/Windows») конфликтом не считается — это неизвестная
-    характеристика, а не подтверждённая совместимость.
+    Требование берётся из опознанной ОС или из платформенного семейства
+    запроса (`platform_family`) — см. `sku_rules.platform_conflict`.
     """
     rule = _RULES_BY_ID.get((reqs or {}).get("os_rule") or "")
-    if not rule or rule.get("kind") != "os":
-        return ""
     return sku_rules.platform_conflict(offer, {**(reqs or {}),
-                                              "os_rule_obj": rule})
+                                               "os_rule_obj": rule})
 
 
 def sku_conflict(offer: dict, reqs: dict) -> str:
@@ -372,7 +389,22 @@ def verify_requirements(offer: dict, reqs: dict) -> dict:
             problems.append("версия ALD Pro в запросе не указана — уточните "
                             "совместимость с вашей версией каталога")
 
-    # 1. ОС из запроса.
+    # 1. Платформа как условие совместимости («антивирус для Windows»).
+    # Конфликт с другой платформой отбракован выше; здесь проверяется
+    # подтверждение: платформа должна быть названа в данных SKU.
+    family = (reqs or {}).get("platform_family")
+    if family:
+        stated = (sku_rules.name_platforms(offer)
+                  or sku_rules.field_platforms(offer))
+        if family in stated:
+            facts.append(f"платформа {family} указана в данных SKU")
+        else:
+            problems.append(
+                f"поддержка платформы {family} в данных SKU не указана")
+            return {"verified": False, "facts": facts, "problems": problems,
+                    "conflict": False, "rule": rule}
+
+    # 2. ОС из запроса.
     if rule:
         alias = _alias_hit(offer, rule.get("evidence") or rule["aliases"])
         if not alias:
@@ -472,6 +504,8 @@ def _requirement_summary(reqs: dict) -> str:
         parts.append("версия " + ", ".join(reqs["version"]))
     if reqs.get("arch"):
         parts.append("арх. " + reqs["arch"])
+    if reqs.get("platform_family"):
+        parts.append("платформа " + reqs["platform_family"])
     if reqs.get("license_type"):
         parts.append(OFFER_TYPE_LABELS.get(reqs["license_type"],
                                           reqs["license_type"]))
@@ -677,7 +711,7 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
         reqs = dict(reqs)
         res_reqs = result.get("requirements") or {}
         for key in ("product_classes", "product_is_os", "os_is_constraint",
-                    "scope_brand"):
+                    "scope_brand", "platform_family"):
             if key not in reqs and key in res_reqs:
                 reqs[key] = res_reqs[key]
 
@@ -824,6 +858,7 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
                    if class_ok(g, strict=True)]
     has_hard_condition = bool(reqs.get("os") or reqs.get("version")
                               or reqs.get("arch") or reqs.get("license_type")
+                              or reqs.get("platform_family")
                               or (reqs.get("wants_os") and not reqs.get("os")))
     if strict_os:
         # Только подтверждённые: неподтверждённые не считаются результатом.
@@ -971,6 +1006,7 @@ def build_top4(result: dict, reqs: dict | None = None) -> dict:
             "version": reqs.get("version") or [],
             "arch": reqs.get("arch"),
             "license_type": reqs.get("license_type"),
+            "platform_family": reqs.get("platform_family"),
             "wants_os": reqs.get("wants_os", False),
             "product_classes": reqs.get("product_classes") or [],
             "product_is_os": reqs.get("product_is_os", False),

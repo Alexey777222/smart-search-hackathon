@@ -404,6 +404,15 @@ def refine_requirements(conn, reqs: dict, text: str) -> dict:
     out["product_is_os"] = scope["product_is_os"]
     out["os_is_constraint"] = scope["os_is_constraint"]
     out["scope_brand"] = scope["brand"]
+
+    # Платформа остаётся обязательным условием, только когда ОС названа
+    # условием совместимости и конкретная ОС не опознана: «антивирус для
+    # Windows». Если покупают ОС («Linux», «российская ОС») или опознана
+    # конкретная ОС («… на Astra Linux»), проверка идёт по классу и
+    # правилу ОС — требование платформы там только мешает.
+    if out.get("platform_family") and not (scope["os_is_constraint"]
+                                           and not out.get("os")):
+        out["platform_family"] = None
     if scope["product_is_os"]:
         out["wants_os"] = True
     elif scope["os_is_constraint"]:

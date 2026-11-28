@@ -272,6 +272,66 @@ def test_new_task_clears_constraints(client, checks):
     print("  [new_task_clears_constraints] done")
 
 
+def test_windows_platform_constraint(client, checks):
+    """8. ОС как условие: «антивирус для Windows» требует платформу Windows."""
+    sid = _create_session(client)
+    reply = _consult(client, sid, "антивирус для Windows")
+    top4 = reply.get("top4") or {}
+    reqs = top4.get("requirements") or {}
+    items = top4.get("items") or []
+
+    # Платформа попала в обязательные условия.
+    checks.append({"label": "8. platform_family = windows в обязательных условиях",
+                   "ok": reqs.get("platform_family") == "windows"})
+    checks.append({"label": "8. платформа отражена в сводке условий",
+                   "ok": "windows" in (reqs.get("summary") or "").lower()})
+
+    # Ни одна позиция не ограничена другой платформой: если платформы
+    # названы, Windows должен быть среди них.
+    for it in items:
+        stated = ((it.get("platform") or "") + " " + (it.get("full_name") or "")).lower()
+        named = [fam for fam in ("windows", "linux") if fam in stated]
+        checks.append({"label": f"8. {it.get('id')}: платформа не противоречит Windows",
+                       "ok": (not named) or ("windows" in named)})
+
+    # Linux-only артикул не проходит ту же проверку (общий механизм,
+    # а не список артикулов).
+    import selection
+    linux_only = {"name": "Антивирус для серверов Linux", "platform": "Linux"}
+    checks.append({"label": "8. артикул только для Linux отбракован как чужая платформа",
+                   "ok": bool(selection.sku_conflict(linux_only, reqs))})
+    print("  [windows_platform_constraint] done")
+
+
+def test_cost_not_summing_alternatives(client, checks):
+    """9. Расчёт стоимости: альтернативы не суммируются как один комплект."""
+    sid = _create_session(client)
+    _consult(client, sid, "нужен антивирус")
+    reply = _consult(client, sid, "сколько будет стоить")
+    answer = reply.get("answer") or ""
+    top4 = reply.get("top4") or {}
+    items = top4.get("items") or []
+    direct = [it for it in items if it.get("role") == "прямое совпадение"]
+
+    if len(direct) > 1:
+        # Альтернативы показаны отдельно и в итог не входят.
+        checks.append({"label": "9. альтернативы выделены отдельным блоком",
+                       "ok": "Альтернатив" in answer})
+        total_line = next((line for line in answer.split("\n")
+                           if line.startswith("Итого")), "")
+        first_price = direct[0].get("price") or 0
+        digits = int("".join(ch for ch in total_line if ch.isdigit()) or 0)
+        # Цена в ответе округляется до рублей (в фиде — копейки).
+        checks.append({"label": "9. итог = цена одной позиции, а не сумма альтернатив",
+                       "ok": digits == round(first_price)})
+        all_sum = sum(it.get("price") or 0 for it in direct)
+        checks.append({"label": "9. итог не равен сумме всех прямых совпадений",
+                       "ok": all_sum <= first_price or abs(digits - all_sum) > 1})
+    checks.append({"label": "9. расчёт на одну единицу с уточнением количества",
+                   "ok": (not direct) or ("1 шт" in answer or "цена не указана" in answer)})
+    print("  [cost_not_summing_alternatives] done")
+
+
 def run():
     print(f"AI_PROVIDER={sys.argv[1] if len(sys.argv) > 1 else 'по умолчанию'}")
     client = TestClient(webapp.app)
@@ -284,6 +344,8 @@ def run():
     test_response_structure(client, checks)
     test_os_constraint_not_product(client, checks)
     test_new_task_clears_constraints(client, checks)
+    test_windows_platform_constraint(client, checks)
+    test_cost_not_summing_alternatives(client, checks)
 
     print("\nПроверки:")
     failed = 0

@@ -498,6 +498,10 @@ def _merge_requirements(server: dict, model: dict, previous: dict | None,
                           or previous.get("restore_scope")),
         "server_owned": bool(server.get("server_owned")
                              or previous.get("server_owned")),
+        # Платформа как условие («антивирус для Windows») переносится в
+        # пределах той же задачи и сбрасывается при новой.
+        "platform_family": (server.get("platform_family")
+                            or previous.get("platform_family")),
         "ald_version": (server.get("ald_version") or model.get("ald_version")
                         or previous.get("ald_version")),
         "clarify_asked": bool(previous.get("clarify_asked")),
@@ -1136,9 +1140,11 @@ class Consultant:
     def _ask_extract(self, session: Session, message: str,
                      started: float) -> dict:
         """Один вызов модели: разбор запроса + локальная подборка товаров."""
-        server_reqs = extract_requirements(message)
-        previous = dict(session.requirements or {})
         conn = self.catalog.conn
+        # Условия извлекаются с индексом: класс продукта и платформа
+        # («антивирус для Windows») определяются по категориям каталога.
+        server_reqs = extract_requirements(message, conn)
+        previous = dict(session.requirements or {})
         question_type = classify_question(message)
         session.question_type = question_type
 
@@ -1354,7 +1360,8 @@ class Consultant:
             "requirements": {key: reqs.get(key) for key in
                              ("os", "version", "arch", "license_type",
                               "wants_os", "role", "restore_scope",
-                              "server_owned", "product_classes")},
+                              "server_owned", "product_classes",
+                              "platform_family")},
             "verified_count": top4.get("verified_count", len(confirmed)),
             "needs_check_count": len(needs_check),
             "no_confirmed_message": top4.get("no_confirmed_message") or "",
@@ -1407,7 +1414,8 @@ class Consultant:
             "requirements": {key: reqs.get(key) for key in
                              ("os", "version", "arch", "license_type",
                               "wants_os", "role", "restore_scope",
-                              "server_owned", "product_classes")},
+                              "server_owned", "product_classes",
+                              "platform_family")},
             "verified_count": top4.get("verified_count",
                                        len(top4.get("items") or [])),
             "needs_check_count": len(top4.get("needs_check") or []),
@@ -1620,39 +1628,53 @@ def _default_answer(query: str, top4: dict, items: list, needs_check: list,
 
 
 def _cost_breakdown(items: list) -> list[str]:
-    """Расчёт стоимости: обязательные компоненты + необязательные."""
+    """Расчёт стоимости: один обязательный продукт + необязательные дополнения.
+
+    Несколько прямых совпадений — это альтернативы одного и того же
+    продукта (разные вендоры под одну задачу), а не компоненты комплекта.
+    В итог берётся одна позиция, остальные показываются как варианты
+    выбора: сумма альтернатив не выдаётся за стоимость решения.
+    """
     lines: list[str] = []
     if not items:
         lines.append("Нет подтверждённых товаров для расчёта.")
         return lines
-    mandatory = [it for it in items if it.get("role") == "прямое совпадение"]
+    direct = [it for it in items if it.get("role") == "прямое совпадение"]
     optional = [it for it in items if it.get("role") != "прямое совпадение"]
-    total = 0
-    missing = []
-    if mandatory:
-        lines.append("Обязательные компоненты (прямое совпадение):")
-        for it in mandatory:
-            price = it.get("price") or 0
-            period = it.get("duration") or ""
-            if price > 0:
-                total += price
-                period_text = f" ({period})" if period else ""
-                lines.append(f"- {it['name']}: {it['price_text']} за 1 шт.{period_text}")
-            else:
-                missing.append(it["name"])
-        lines.append(f"Итого за обязательные компоненты: {total:,.0f} ₽".replace(",", " "))
-        if missing:
-            lines.append(f"Цены по следующим позициям не указаны: {', '.join(missing)} — уточните количество и период.")
+    chosen, alternatives = (direct[:1], direct[1:]) if direct else ([], [])
+
+    def price_line(it: dict) -> str:
+        period = it.get("duration") or ""
+        period_text = f" ({period})" if period else ""
+        if (it.get("price") or 0) > 0:
+            return f"- {it['name']}: {it['price_text']} за 1 шт.{period_text}"
+        return f"- {it['name']}: цена не указана"
+
+    if chosen:
+        lines.append("Обязательный компонент (выбранный товар):")
+        for it in chosen:
+            lines.append(price_line(it))
+        total = sum((it.get("price") or 0) for it in chosen)
+        lines.append(f"Итого за обязательный компонент: {total:,.0f} ₽".replace(",", " "))
+        if any((it.get("price") or 0) <= 0 for it in chosen):
+            lines.append("Цена выбранной позиции не указана — уточните "
+                         "количество и период у менеджера.")
+        else:
+            lines.append("Расчёт на 1 лицензию: уточните количество "
+                         "пользователей или серверов и период.")
+    else:
+        lines.append("Подтверждённых прямых совпадений нет — "
+                     "обязательный компонент не выбран.")
+
+    if alternatives:
+        lines.append("Альтернативы тому же компоненту (в расчёт не входят, "
+                     "выбирается одна позиция):")
+        for it in alternatives:
+            lines.append(price_line(it))
     if optional:
         lines.append("Дополнительные (необязательные):")
         for it in optional:
-            price = it.get("price") or 0
-            period = it.get("duration") or ""
-            if price > 0:
-                period_text = f" ({period})" if period else ""
-                lines.append(f"- {it['name']}: {it['price_text']} за 1 шт.{period_text}")
-            else:
-                lines.append(f"- {it['name']}: цена не указана")
+            lines.append(price_line(it))
     return lines
 
 
